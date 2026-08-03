@@ -20,33 +20,50 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 ## Architecture
 
 ```
-┌─────────────────────────────── Mac / local ───────────────────────────────┐
-│  LLM agent (e.g. Hermes)                                                  │
-│    │  MCP client                                                          │
-│    ▼                                                                      │
-│  MemoryCore MCP server                                                    │
-│    ├─ local_store.py        hot tier: MEMORY.md / USER.md (chars-based)   │
-│    ├─ classifier.py         cold/hot/stale routing rules                  │
-│    ├─ overflow.py           six-step overflow                             │
-│    ├─ maintenance.py        cold-tier governance                          │
-│    └─ cold_store_client.py  →  MCP streamable-http                        │
-└───────────────────────────────────────────────────────────────────────────┘
-                                    │  remember / recall / update / forget / stats
-                                    ▼
-                        remote MCP memory service (cold tier)
+┌─────────────────────────────── Mac / local ──────────────────────────────┐
+│  LLM agent (e.g. Hermes)                                                 │
+│    │  MCP client                                                         │
+│    ▼                                                                     │
+│  MemoryCore MCP server                                                   │
+│    ├─ local_store.py        hot tier: MEMORY.md / USER.md (chars-based)  │
+│    ├─ classifier.py         cold/hot/stale routing rules                 │
+│    ├─ overflow.py           six-step overflow                            │
+│    ├─ maintenance.py        cold-tier governance                         │
+│    └─ cold_store_client.py  →  LocalBackend (SQLite, in-process)         │
+│                               or RemoteBackend (MCP streamable-http)     │
+└──────────────────────────────────────────────────────────────────────────┘
+                     LocalBackend: mnemosyne-memory (pid)
+                     RemoteBackend: remote MCP memory service
 ```
 
-## Quick Start
+## Quick Start (single machine — zero external services)
 
 ```bash
 pip install origin-memorycore
 
-# point at any MCP memory service exposing the cold-store contract
-export MNEMOSYNE_URL="http://your-memory-service:9000/mcp"
-export MEMORY_DIR="$HOME/.hermes/memories"   # optional; default shown
-
+# That's it! MemoryCore now runs entirely locally:
+#   - Hot tier: MEMORY.md / USER.md (default ~/.hermes/memories)
+#   - Cold tier: SQLite via mnemosyne-memory (default ~/.memorycore/data)
 python -m memorycore.server          # stdio transport (default)
-# or: memorycore  (if installed via console script)
+```
+
+On first run the local embedding model (`BAAI/bge-small-zh-v1.5`, ~50 MB,
+MIT license) is downloaded automatically via fastembed. If your network
+cannot reach huggingface.co, fastembed will try the GCS mirror first.
+
+**Troubleshooting the first download:**
+
+- If the download fails (e.g. behind a restrictive firewall), you can
+  point `MNEMOSYNE_EMBEDDING_API_URL` at any OpenAI-compatible embedding
+  API (Ollama, local llama.cpp, etc.) and set `MNEMOSYNE_EMBEDDING_MODEL`
+  to the model name served by that endpoint.
+- The data directory defaults to `~/.memorycore/data`.  Override with
+  `MNEMOSYNE_DATA_DIR`.
+
+```bash
+# Example: use Ollama bge-m3 instead of fastembed
+export MNEMOSYNE_EMBEDDING_API_URL="http://localhost:11434/v1"
+export MNEMOSYNE_EMBEDDING_MODEL="bge-m3"
 ```
 
 Register it in your MCP client (example for Hermes Agent `config.yaml`):
@@ -56,8 +73,17 @@ mcp_servers:
   memorycore:
     command: python
     args: ["-m", "memorycore.server"]
-    env:
-      MNEMOSYNE_URL: "http://your-memory-service:9000/mcp"
+```
+
+### Remote mode (optional)
+
+If you prefer a shared remote Mnemosyne MCP service instead of the local
+engine, set `MEMORYCORE_COLD_BACKEND=remote`:
+
+```bash
+export MEMORYCORE_COLD_BACKEND=remote
+export MNEMOSYNE_URL="http://your-memory-service:9000/mcp"
+python -m memorycore.server
 ```
 
 Exposed tools:
@@ -88,9 +114,13 @@ See [examples/cold-store-contract.md](examples/cold-store-contract.md) for the f
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `MNEMOSYNE_URL` | *(required)* | Cold-tier MCP endpoint |
+| `MEMORYCORE_COLD_BACKEND` | `local` | Cold-tier backend: `local` (in-process) or `remote` (MCP) |
+| `MNEMOSYNE_URL` | *(empty)* | Cold-tier MCP endpoint (required for `remote` mode) |
+| `MNEMOSYNE_DATA_DIR` | `~/.memorycore/data` | Local SQLite data directory |
+| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-zh-v1.5` | Local embedding model (512-dim, Chinese) |
+| `MNEMOSYNE_EMBEDDING_API_URL` | *(empty)* | External embedding API (unset = fastembed built-in) |
 | `MEMORY_DIR` | `~/.hermes/memories` | Hot-tier directory (`MEMORY.md` / `USER.md`) |
-| `MNEMOSYNE_TIMEOUT` | `10.0` | Cold-tier request timeout (seconds) |
+| `MNEMOSYNE_TIMEOUT` | `10.0` | Cold-tier request timeout (remote mode, seconds) |
 
 Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_THRESHOLD`, `HARD_THRESHOLD`, `TARGET_RATIO`).
 
@@ -106,3 +136,10 @@ Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_TH
 ## License
 
 [MIT](LICENSE) © 2026 moonandecho
+
+### Third-party licenses
+
+- [mnemosyne-memory](https://github.com/abdias/mnemosyne) — MIT,
+  © Abdias J. The in-process memory engine used by `LocalBackend`.
+- [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5) — MIT,
+  by Beijing Academy of Artificial Intelligence. Default local embedding model.

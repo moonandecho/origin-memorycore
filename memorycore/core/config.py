@@ -20,11 +20,39 @@ MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", os.path.expanduser("~/.hermes/mem
 MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 USER_FILE = MEMORY_DIR / "USER.md"
 
-# ---- cold tier engine (remote MCP memory service) ----
-# Required: point MNEMOSYNE_URL at any MCP memory service exposing
-# remember/recall/update/forget/stats (see examples/cold-store-contract.md).
+# ---- cold tier engine (dual backend: local in-process or remote MCP) ----
+# MEMORYCORE_COLD_BACKEND: "local" (default) or "remote"
+#   - local:  uses mnemosyne-memory in-process (zero external services)
+#   - remote: connects to an MCP memory service via MNEMOSYNE_URL
+COLD_BACKEND = os.environ.get("MEMORYCORE_COLD_BACKEND", "local")
+
+# ---- cold tier — remote mode ----
+# Required when COLD_BACKEND=remote: point MNEMOSYNE_URL at any MCP memory
+# service exposing remember/recall/update/forget/stats
+# (see examples/cold-store-contract.md).
 MNEMOSYNE_URL = os.environ.get("MNEMOSYNE_URL", "")
 MNEMOSYNE_TIMEOUT = 10.0
+
+# ---- cold tier — local mode (mnemosyne-memory in-process) ----
+# Data directory for the local SQLite database.
+# Default ~/.memorycore/data; override with MNEMOSYNE_DATA_DIR (the env var
+# that the mnemosyne library itself recognises).
+MNEMOSYNE_DATA_DIR = os.environ.get(
+    "MNEMOSYNE_DATA_DIR",
+    os.path.expanduser("~/.memorycore/data"),
+)
+# Ensure the env var is set for the mnemosyne library to pick up.
+if "MNEMOSYNE_DATA_DIR" not in os.environ:
+    os.environ["MNEMOSYNE_DATA_DIR"] = MNEMOSYNE_DATA_DIR
+
+# Local embedding model — fastembed built-in (no API key needed).
+# bge-small-zh-v1.5: Chinese-optimised, 512-dim, MIT license, ~50 MB.
+# Set MNEMOSYNE_EMBEDDING_API_URL to use an external API instead.
+if "MNEMOSYNE_EMBEDDING_MODEL" not in os.environ:
+    os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = "BAAI/bge-small-zh-v1.5"
+# Deliberately do NOT set MNEMOSYNE_EMBEDDING_API_URL so the library uses
+# fastembed (local ONNX) by default. Users who want Ollama / OpenAI / etc.
+# can set MNEMOSYNE_EMBEDDING_API_URL themselves.
 
 # ---- LLM (optional, merge enhancement for ambiguous groups) ----
 # Used by overflow merge when rule-based dedup cannot resolve an ambiguous
