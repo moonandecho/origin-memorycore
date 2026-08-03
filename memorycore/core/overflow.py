@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """core/overflow.py — 六步溢流流程 v2 完整版
 
-把本地热层 (MEMORY.md / USER.md) 中低频/过时数据安全迁移到冷层 cold tier。
+把本地热层 (MEMORY.md / USER.md) 中低频/过时数据安全迁移到冷层 Mnemosyne。
 
 六步:
   1. 容量基线统计
@@ -36,7 +36,7 @@ def run_overflow(store, client, target: str) -> dict:
 
     Args:
         store: LocalStore 实例
-        client: ColdStoreClient 实例
+        client: MnemosyneClient 实例
         target: "memory" | "user"
 
     Returns:
@@ -219,32 +219,87 @@ def _merge_local_fragments(entries: List[str]) -> Tuple[List[str], int]:
     return merged, merge_count
 
 
+def _norm_sentence(s: str) -> str:
+    """规范化句子用于去重: 去空白/标点, 保留括号内容, 小写。
+
+    括号内容 (路径/注释/别名如 Code Drive、SMB 共享) 是语义核心,
+    删除会导致同义句 \"D 盘=/home/echo/D (Code Drive...)\" 与
+    \"D 盘=Code Drive (path=/home/echo/D...)\" 规范化后反而不同。
+    """
+    s = re.sub(r"[\s，。！？；;、,：:·\-—/\\=_]+", "", s)
+    return s.lower()
+
+
+def _bigram_coverage(short: str, long_bigrams: set) -> float:
+    """短句 bigram 在长文本 bigram 集中的覆盖率 (0.0-1.0)。"""
+    if len(short) < 2:
+        return 0.0
+    s_b = {short[i:i + 2] for i in range(len(short) - 1)}
+    if not s_b:
+        return 0.0
+    hit = sum(1 for b in s_b if b in long_bigrams)
+    return hit / len(s_b)
+
+
+def _sentence_is_dup(s: str, base_norm: str, base: str) -> bool:
+    """判断句子 s 是否与 base 语义重复。
+
+    判定链: 规范化子串包含 → SequenceMatcher → bigram 覆盖率。
+    覆盖率针对\"同义但语序/用词不同\"的重复 (如 D 盘两种表述),
+    短句的大多数字符片段出现在主体中即视为重复; 含独特信息的
+    句子覆盖率低, 会被保留。太短 (<=6 字) 不判重。
+    """
+    sn = _norm_sentence(s)
+    if not sn:
+        return True
+    if len(sn) <= 6:
+        return False
+    if sn in base_norm or base_norm in sn:
+        return True
+    if difflib.SequenceMatcher(None, sn, base_norm).ratio() > 0.8:
+        return True
+    base_bigrams = {base_norm[i:i + 2] for i in range(len(base_norm) - 1)}
+    if _bigram_coverage(sn, base_bigrams) > 0.55:
+        return True
+    return False
+
+
 def _merge_group(entries: List[str]) -> str:
-    """合并一组同主题条目: 最长为主体, 追加不重复句子。"""
+    """合并一组同主题条目: 最长为主体, 追加不重复句子。
+
+    去重分两级:
+    1. 整条级: 与主体高度相似 (ratio > 0.85) 的条目整条跳过
+       (如同一事实的多条近似重复记录);
+    2. 句子级: 规范化后子串包含 / SequenceMatcher / bigram Jaccard,
+       与主体及已追加句子都判重, 消除逗号句内的同义重复。
+    """
     if len(entries) == 1:
         return entries[0]
 
     sorted_entries = sorted(entries, key=len, reverse=True)
     base = sorted_entries[0]
-    base_sentences = set(re.split(r"[。！？;；\n]", base))
+    base_norm = _norm_sentence(base)
 
-    extra = []
+    kept = []
     for entry in sorted_entries[1:]:
+        if _smart_ratio(entry, base) > 0.85:
+            continue
         for s in re.split(r"[。！？;；\n]", entry):
             s = s.strip()
             if not s:
                 continue
-            is_new = True
-            for bs in base_sentences:
-                if (s in bs or bs in s or
-                        difflib.SequenceMatcher(None, s, bs).ratio() > 0.8):
-                    is_new = False
+            if _sentence_is_dup(s, base_norm, base):
+                continue
+            dup = False
+            for k in kept:
+                if _sentence_is_dup(s, _norm_sentence(k), k):
+                    dup = True
                     break
-            if is_new:
-                extra.append(s)
+            if not dup:
+                kept.append(s)
 
-    if extra:
-        base = base.rstrip("。！？;；\n") + "。" + "。".join(extra) + "。"
+    if kept:
+        base = base.rstrip("。！？;；\n") + "。" + "。".join(kept) + "。"
     return base
 
 
