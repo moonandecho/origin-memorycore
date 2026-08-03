@@ -26,6 +26,14 @@ USER_FILE = MEMORY_DIR / "USER.md"
 MNEMOSYNE_URL = os.environ.get("MNEMOSYNE_URL", "")
 MNEMOSYNE_TIMEOUT = 10.0
 
+# ---- LLM (optional, merge enhancement for ambiguous groups) ----
+# Used by overflow merge when rule-based dedup cannot resolve an ambiguous
+# same-topic group. Falls back to pure rules when unset or on any failure.
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
+LLM_TIMEOUT = 15.0
+
 # ---- 冷热判定关键词 (热数据特征: 每轮都要用的偏好/准则/纠正/常量) ----
 HOT_KEYWORDS = [
     "偏好", "准则", "原则", "禁止", "必须", "习惯", "要求",

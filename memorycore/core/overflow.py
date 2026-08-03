@@ -298,9 +298,92 @@ def _merge_group(entries: List[str]) -> str:
             if not dup:
                 kept.append(s)
 
+    if len(kept) >= 2 and len(sorted_entries) >= 3:
+        # 方案 C: 复杂组 (≥2 条候选新句 且 ≥3 条同主题) 交给 LLM 智能整合;
+        # LLM 不可用 / 超时 / 校验不过 → 返回 None, 回退下方规则拼接。
+        llm_result = _llm_merge(base, kept)
+        if llm_result is not None:
+            return llm_result
+
     if kept:
         base = base.rstrip("。！？;；\n") + "。" + "。".join(kept) + "。"
     return base
+
+
+def _llm_merge(base: str, new_sentences: List[str]) -> Optional[str]:
+    """LLM 整合同主题组 (去重 + 保持全部独特信息)。
+
+    边界:
+    - 只做"重复整合", 不自由发挥 (prompt 硬约束: 保留全部独特信息,
+      不添加/不推断/不修改事实);
+    - 失败路径 (无 key / 网络错误 / 超时 / 解析失败 / 信息保留校验不过)
+      一律返回 None, 由调用方回退纯规则拼接, 溢流永不阻塞。
+    """
+    from .config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT
+
+    if not LLM_API_KEY:
+        return None
+
+    supplements = "\n".join(f"- {s}" for s in new_sentences)
+    prompt = (
+        "你是记忆整理助手。以下是一组同主题的记忆条目, 内容重复或互为补充:\n"
+        f"<base>{base}</base>\n"
+        f"<supplements>\n{supplements}\n</supplements>\n"
+        "要求合并成一条简洁完整的记忆:\n"
+        "1. 保留全部独特信息 (路径/数字/账号/专有名词等细节不能丢)\n"
+        "2. 重复表述只保留一次, 用最清晰的一种\n"
+        "3. 不添加任何新事实, 不推断, 不修改事实\n"
+        '4. 只输出 JSON: {"merged": "合并后的单条文本"}'
+    )
+
+    try:
+        import json
+        import urllib.request
+
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 2000,
+            "response_format": {"type": "json_object"},
+        }
+        req = urllib.request.Request(
+            LLM_BASE_URL.rstrip("/") + "/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {LLM_API_KEY}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+        content = data["choices"][0]["message"]["content"].strip()
+        content = re.sub(r"^```(json)?|```$", "", content, flags=re.M).strip()
+        text = json.loads(content).get("merged", "").strip()
+    except Exception:
+        return None
+
+    # 校验 1: 长度合理
+    if not text or len(text) < 30 or len(text) > 5000:
+        return None
+    # 校验 2: 信息保留 — 规则认定的每条新句核心内容须出现在 LLM 输出中
+    merged_bigrams = {
+        _norm_sentence(text)[i:i + 2]
+        for i in range(len(_norm_sentence(text)) - 1)
+    }
+    scores = []
+    for s in new_sentences:
+        sn = _norm_sentence(s)
+        if len(sn) <= 6:
+            continue
+        scores.append(_bigram_coverage(sn, merged_bigrams))
+    if not scores:
+        return None
+    if sum(scores) / len(scores) < 0.5:
+        return None  # 信息保留不足, 回退规则
+
+    return text
 
 
 # ---- 辅助函数 ------------------------------------------------------------
