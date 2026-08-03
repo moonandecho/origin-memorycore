@@ -170,5 +170,29 @@ def memorycore_get_memory_usage() -> str:
     }, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# Tool 5: memorycore_recall — active cold-tier recall (read-only)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memorycore_recall(query: str, top_k: int = 3) -> str:
+    """Actively recall cold-tier memories (read-only; complements the
+    per-turn top-3 prefetch with on-demand manual queries).
+
+    Args:
+        query: natural-language semantic query
+        top_k: number of results (default 3, max 10)
+    Returns:
+        JSON: {"results": [{"id": ..., "content": ..., "score": ...}]}
+              or {"error": "..."} when the cold tier is unreachable.
+    """
+    try:
+        k = max(1, min(int(top_k), 10))
+        results = _client.recall_results(query, top_k=k)
+        return json.dumps({"results": results}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
