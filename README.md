@@ -65,6 +65,7 @@ Exposed tools:
 | Tool | Purpose |
 |---|---|
 | `memorycore_store_fact(content, importance, scope, target)` | Unified write entry: routes cold / hot / stale |
+| `memorycore_recall(query, top_k)` | Actively recall cold-tier memories (read-only, complements per-turn prefetch) |
 | `memorycore_trigger_overflow(target)` | Run six-step overflow, target ≤40% |
 | `memorycore_run_cold_storage_maintenance()` | Cold-tier governance pass |
 | `memorycore_get_memory_usage()` | Hot-tier usage + cold-tier stats + thresholds |
