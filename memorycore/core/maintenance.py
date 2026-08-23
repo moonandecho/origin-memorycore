@@ -757,10 +757,26 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int
                 continue
 
             if result.get("decision") == "stale":
-                stale_ids = set(result.get("stale_ids", []))
+                stale_ids = set(result.get("stale_ids") or [])
+                # LLM 判整批 stale 但未给具体 ID (stale_ids 为空) 时,
+                # source_decision 标注与 LLM 实际判定一致; 仅在给了部分
+                # ID 时其余条目才标 llm_not_stale。
+                fallback_label = (
+                    "llm_stale_no_ids" if not stale_ids else "llm_not_stale"
+                )
                 for entry in batch:
                     if entry["id"] in stale_ids:
                         try:
+                            # LLM 判 stale 的长条目 forget 前先进回收站,
+                            # 与短条目 (stale_short) / 溢流路径对齐, 保留
+                            # 30 天恢复窗口。先写回收站成功才 forget
+                            # (保守: trash.add 失败 → 条目保留冷层, 下轮再评估)。
+                            trash.add(
+                                entry["id"],
+                                entry.get("content", ""),
+                                reason="stale_long",
+                                source_decision="llm_stale",
+                            )
                             client.forget(entry["id"])
                             cleaned += 1
                             forgotten_ids.add(entry["id"])
@@ -768,11 +784,12 @@ def _clean_stale(client, entries: List[Dict[str, Any]], trash=None) -> Tuple[int
                             pass
                     else:
                         # 同批未标记为 stale → 入回收站
+                        # (stale_ids 为空时标注 llm_stale_no_ids)
                         trash.add(
                             entry["id"],
                             entry.get("content", ""),
                             reason="stale_candidate",
-                            source_decision="llm_not_stale",
+                            source_decision=fallback_label,
                         )
             else:
                 # LLM 判 not_stale → 入回收站
