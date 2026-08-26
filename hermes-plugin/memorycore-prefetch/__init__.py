@@ -65,10 +65,11 @@ try:
         CHAR_LIMIT_MEMORY,
         CHAR_LIMIT_USER,
     )
-    from memorycore.core.overflow import run_overflow  # noqa: E402
+    from memorycore.core.overflow import run_overflow, restore_stubs_from_results  # noqa: E402
     from memorycore.core.decay import _apply_decay  # noqa: E402
     from memorycore.core.metadata import direct_write_govern  # noqa: E402
     from memorycore.core.metadata import log_activity_query  # noqa: E402  # Phase 3 S4
+    from memorycore.core.metadata import MetaStore  # noqa: E402  # Phase 4 stub restore
 except ImportError:
     _REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     sys.path.insert(0, _REPO_ROOT)
@@ -80,9 +81,10 @@ except ImportError:
         CHAR_LIMIT_MEMORY,
         CHAR_LIMIT_USER,
     )
-    from memorycore.core.overflow import run_overflow  # noqa: E402
+    from memorycore.core.overflow import run_overflow, restore_stubs_from_results  # noqa: E402
     from memorycore.core.decay import _apply_decay  # noqa: E402
     from memorycore.core.metadata import direct_write_govern  # noqa: E402
+    from memorycore.core.metadata import MetaStore  # noqa: E402  # Phase 4 stub restore
     from memorycore.core.metadata import log_activity_query  # noqa: E402  # Phase 3 S4
 
 _RECALL_CANDIDATES = 20    # first-stage recall candidates (dense-only, 2026-08-11)
@@ -359,6 +361,20 @@ class MemoryCorePrefetchProvider(MemoryProvider):
             results = self._filter_by_dense_topn(results)
             results = self._dedupe_injected(results)
             results = self._dedupe_hot_layer(results)
+            # Phase 4 (2026-08-26): recall hit on a stub cold_id -> restore
+            # full text to hot tier. Every-turn auto-recall is the main
+            # traffic; an evicted rule returns as soon as it is genuinely used.
+            try:
+                _store = LocalStore()
+                results = restore_stubs_from_results(
+                    _store,
+                    {"memory": MetaStore("memory", memory_path=_store.memory_path,
+                                         user_path=_store.user_path),
+                     "user": MetaStore("user", memory_path=_store.memory_path,
+                                       user_path=_store.user_path)},
+                    results)
+            except Exception:
+                pass  # restore failure never blocks injection (retried next turn)
             return self._format_results(results)
         except Exception as e:
             logger.debug("memorycore-prefetch sync recall failed: %s", e)
