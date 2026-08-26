@@ -29,6 +29,12 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 - **Cold/hot routing** — every write is classified: high-importance or preference-like → hot (local); low-frequency fact → cold (remote); stale status record → dropped.
 - **Six-step overflow** — capacity baseline → dedup → stale filtering → merge → safe write (cold first, then delete local) → verification.
 - **Cold-tier maintenance** — dedup merge, stale cleanup, conflict resolution, embedding integrity check.
+- **Hot-tier rule budget (LRU cache model)** — the hot tier is a cache,
+  not a ranking: rules live under a character budget (default 3200) and
+  lifetime is decided by activity, not age. Inactive low-weight rules are
+  evicted to the cold tier as pointer stubs and restored automatically the
+  moment a recall hits them — no rule is permanent (protection is a weight
+  multiplier, never an exemption).
 - **Capacity control** — soft threshold (overflow once before writing) / hard threshold (force overflow) / target ratio. Defaults: 60% / 80% / 40% of a 5000-char limit.
 - **Graceful degradation** — cold tier unreachable? Writes fail loudly (never silently dropped), overflow keeps local entries, health check returns local status with `cold.error`.
 - **Zero core modification** — designed as a drop-in companion; your agent's built-in memory tools keep working.
@@ -288,8 +294,10 @@ observable signals decide *eligibility and ordering* — pressure decides
 | S5 cross-tier redundancy | cold-tier recall match | an equivalent cold copy already exists → drop the hot copy (zero information loss) |
 
 **Tiered protection**: A-class meta-rules (behavior / interaction /
-writing-style precepts), red-line rules and importance ≥ 0.9 entries never
-take S2/S4/S5 — they only merge or compress. Stub pointers have a lifecycle
+writing-style precepts), red-line rules and importance ≥ 0.9 entries are
+protected by a weight multiplier (×3.0) — harder to evict, never exempt.
+Under the Phase 4 budget model they still decay and can retire if they stop
+being used; the multiplier only makes that take much longer. Stub pointers have a lifecycle
 of their own (oldest-first GC under hard pressure; the cold tier is never
 touched), so pointers cannot fill the tier a second time. Every exit is
 *cold-write-first*: the local entry changes only after the cold tier
@@ -301,10 +309,48 @@ Constants (`memorycore/core/config.py`): `RULE_RETYPE_DAYS=60`,
 `RULE_STUB_IDLE_DAYS=45`, `ACTIVITY_WINDOW_DAYS=30`, `MAX_STUB_PER_RUN=3`,
 `STUB_MAX_CHARS=40`, `IMPORTANCE_PROTECT=0.9`.
 
+### Rule budget — LRU cache model
+
+Phase 4 (2026-08-26) turns rule retention into a budgeted LRU: the cold
+tier is the full record, the hot tier keeps only what is actively being
+used.
+
+- **No permanent rules.** Every rule can retire. Protection is a weight
+  multiplier (×3.0 for A-class / red-line / importance ≥ 0.9), never an
+  exemption — a rule that stops being used decays and eventually leaves.
+- **Character budget.** Rule ecology (rules + stubs) is capped at
+  `RULE_BUDGET_CHARS=3200` (64% of the 5000-char limit). Writes that
+  overflow the budget trigger immediate eviction of the lowest-weight
+  rules (≤3 per run, cold-write-first, confirmed write before any local
+  change).
+- **Activity decides lifetime, not age.** Each overflow run scans the
+  queries logged since the last scan (incremental, local `activity.jsonl`)
+  and embeds them in one batch against cached rule vectors — semantic
+  cosine ≥ `HIT_STRONG_COS=0.48` counts as a strong hit (+1.0, at most once
+  per scan per rule); when the embedding service is unreachable, lexical
+  bigram evidence degrades to a weak hit (+0.3, no anchor refresh). Weight
+  decays with a 30-day half-life since the last strong touch.
+- **Retire to a pointer, restore on use.** Evicted rules go to the cold
+  tier first; a ≤40-char stub keeps the cold_id. When a recall — manual
+  `memorycore_recall` or the per-turn prefetch — hits that cold_id, the
+  full text returns to the hot tier with a fresh weight and a 7-day
+  residency. A rule comes back the moment it is genuinely used again.
+- **Guardrails.** New/restored rules hold a 7-day minimum residency
+  (temporary, not permanent); at most 3 rules are evicted per run; the
+  whole mechanism rolls back with `MEMORYCORE_RULE_BUDGET_ENABLED=0`; and
+  without an activity log the budget layer disables itself, leaving the
+  hard 5000-char limit as the backstop.
+
+Constants (`memorycore/core/config.py`): `RULE_BUDGET_CHARS=3200`,
+`RULE_MIN_RESIDENCY_DAYS=7`, `WEIGHT_HALF_LIFE_DAYS=30`,
+`HIT_STRONG_COS=0.48`, `HIT_WEAK_MODE=degraded`, `MAX_EVICT_PER_RUN=3`.
+
 ### Health check: memorycore_memory_audit
 
 A read-only tool listing every hot-tier entry with its type, age,
-retirement plan and keep/sink classification — the observability anchor for
+retirement plan and keep/sink classification, plus Phase 4 LRU
+observability per rule (weight / effective weight / last active / residency
+days) and a rule-chars-vs-budget summary — the observability anchor for
 diagnosing an overflow that finds nothing to sink.
 
 ## Scale test & optimisation results
