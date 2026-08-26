@@ -412,4 +412,4 @@ def memorycore_recall(query: str, top_k: int = 3) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport="stdio", show_banner=False)  # FastMCP 3.x banner pollutes stdio stdout
