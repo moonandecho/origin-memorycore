@@ -263,8 +263,9 @@ hermes config set memory.provider memorycore-prefetch
 
 ### 体检工具: memorycore_memory_audit
 
-只读工具,列出热层每条条目的类型、年龄、退役计划与 keep/sink 判定 ——
-排查"溢流空转"(热层满了却无条目可沉)的观测锚点。
+只读工具,列出热层每条条目的类型、年龄、退役计划与 keep/sink 判定,并附带
+Phase 4 LRU 观测(每条规则的 weight / 有效权重 / 最近活跃 / 驻留天数)与
+规则字符-预算对比 —— 排查"溢流空转"(热层满了却无条目可沉)的观测锚点。
 
 ## 规模化测试与优化结果
 
