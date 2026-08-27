@@ -173,6 +173,12 @@ WEIGHT_HALF_LIFE_DAYS = 30          # half-life = ACTIVITY_WINDOW_DAYS (self-con
 WEIGHT_PROTECT_MULT = 3.0           # A-class/red-line/importance>=0.9 multiplier: 3x harder to evict
 WEIGHT_KWSINK_MULT = 0.5            # kw-sinkable rules (should_keep_local=False) weight halved
 MAX_EVICT_PER_RUN = 3               # eviction cap per run (matches MAX_STUB_PER_RUN)
+# ---- Audit activity-dimension sink candidates (2026-08-28) ----
+# rule 型条目: weight 低于 AUDIT_SINK_WEIGHT_THRESHOLD 且 last_active_at
+# 距今超过 AUDIT_SINK_INACTIVE_DAYS 且非 protected → audit 标为 sink_candidate。
+# 仅体检可见性, 不改溢流执行逻辑 (实际被挤仍需超预算触发 enforce_rule_budget)。
+AUDIT_SINK_WEIGHT_THRESHOLD = 1.5
+AUDIT_SINK_INACTIVE_DAYS = 30
 
 # ---- Phase 4 activity signal (semantic two-tier, calibrated 2026-08-26) ----
 # Measured on real data: _topic_overlap passes 0/780 pairs (lexical-only main
