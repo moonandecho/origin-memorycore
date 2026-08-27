@@ -90,7 +90,7 @@ _ANCHOR_QUERY = _ANCHOR_PREFIX  # P3-4: 从 _ANCHOR_PREFIX 派生 (原硬编码 
 
 
 # ---- Phase 3: rule 失效信号 (2026-08-20 设计定稿"分层保护") -----------------
-# 设计: /Users/echo/.hermes/tmp/rule-stale-design.md
+# 设计: /tmp/rule-stale-design.md
 # 约束 1 修正: B 类按失效证据分层放弃; A 类/红线类/importance≥0.9 绝不误伤。
 
 # S6 保护线: A 类元行为准则 (每轮适用, 主题活性信号无判别力) —
@@ -1051,8 +1051,8 @@ def _norm_sentence(s: str) -> str:
     """规范化句子用于去重: 去空白/标点, 保留括号内容, 小写。
 
     括号内容 (路径/注释/别名如 Code Drive、SMB 共享) 是语义核心,
-    删除会导致同义句 \"D 盘=/home/echo/D (Code Drive...)\" 与
-    \"D 盘=Code Drive (path=/home/echo/D...)\" 规范化后反而不同。
+    删除会导致同义句 "D 盘=/home/user/D (Code Drive...)" 与
+    "D 盘=Code Drive (path=/home/user/D...)" 规范化后反而不同。
     """
     s = re.sub(r"[\s，。！？；;、,：:·\-—/\\=_]+", "", s)
     return s.lower()

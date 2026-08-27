@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 # Fallback: repo root two levels up (development mode, not pip-installed).
 try:
     from memorycore.cold_store_client import ColdStoreClient  # noqa: E402
-    from memorycore.local_store import LocalStore  # noqa: E402
+    from memorycore.local_store import LocalStore, normalize_for_compare  # noqa: E402
     from memorycore.core.config import (  # noqa: E402
         SOFT_THRESHOLD,
         HARD_THRESHOLD,
@@ -74,7 +74,7 @@ except ImportError:
     _REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     sys.path.insert(0, _REPO_ROOT)
     from memorycore.cold_store_client import ColdStoreClient  # noqa: E402
-    from memorycore.local_store import LocalStore  # noqa: E402
+    from memorycore.local_store import LocalStore, normalize_for_compare  # noqa: E402
     from memorycore.core.config import (  # noqa: E402
         SOFT_THRESHOLD,
         HARD_THRESHOLD,
@@ -152,6 +152,9 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         # injection dedup state (2026-08-05): per-session id set + hot-tier full text
         self._injected_ids: set = set()
         self._hot_text: str = ""
+        # 2026-08-28: normalized hot-tier text — punctuation/whitespace
+        # variants of hot entries are no longer re-injected
+        self._hot_norm: str = ""
         # on_memory_write auto-overflow state
         self._overflow_lock = threading.Lock()
         self._overflow_thread: Optional[threading.Thread] = None
@@ -171,6 +174,7 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         """Reset per-session dedup state and load hot-tier full text."""
         self._injected_ids = set()
         self._hot_text = self._load_hot_layer_text()
+        self._hot_norm = normalize_for_compare(self._hot_text)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
@@ -449,13 +453,18 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         return kept
 
     def _dedupe_hot_layer(self, results: list) -> list:
-        """Hot-tier dedup: skip entries whose content already exists in hot tier."""
-        if not self._hot_text:
+        """Hot-tier dedup: skip entries whose content already exists in hot tier.
+
+        2026-08-28: normalized comparison (fullwidth/whitespace variants of
+        hot entries also dedupe) — shares normalize_for_compare with
+        local_store.add (single source of truth).
+        """
+        if not self._hot_norm:
             return results
         kept = []
         for r in results:
             content = r.get("content", "")
-            if content and content in self._hot_text:
+            if content and normalize_for_compare(content) in self._hot_norm:
                 continue
             kept.append(r)
         return kept
