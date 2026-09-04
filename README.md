@@ -30,6 +30,7 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 - **Cold/hot routing** — every write is classified: high-importance or preference-like → hot (local); low-frequency fact → cold (remote); stale status record → dropped.
 - **Six-step overflow** — capacity baseline → dedup → stale filtering → merge → safe write (cold first, then delete local) → verification.
 - **Cold-tier maintenance** — dedup merge, stale cleanup, conflict resolution, embedding integrity check.
+- **Weekly maintenance (optional)** — `python -m memorycore.weekly_maintenance` runs the full weekly pass headlessly: six-step overflow → smart tidy → cold-tier maintenance → report saved under `logs/`. Smart tidy sinks stale dated history (LLM-confirmed, cold-tier written first) and merges overlapping behavior rules (originals archived to cold tier). Protected rules are never deleted — conservative by design. Notifications are optional via env `MEMORYCORE_NOTIFY_SCRIPT` (report piped to your script); nothing personal is hardcoded.
 - **Hot-tier rule budget (LRU cache model)** — the hot tier is a cache,
   not a ranking: rules live under a character budget (default 3200) and
   lifetime is decided by activity, not age. Inactive low-weight rules are
