@@ -83,8 +83,12 @@ ollama pull qwen3-embedding:0.6b
 ### 安装与运行
 
 ```bash
+# 推荐: 用独立 venv 安装 — 不要与其它工具 (如 Hermes) 共用环境,
+# 共用会让 memorycore 的 mcp 版本被别人决定, 宿主升级会连带它启动失败
+python3 -m venv .venv && source .venv/bin/activate
 pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
 
+# 依赖: mcp>=2,<3 (已知兼容 2.0.0 / 2.2.0)
 # 就这样! MemoryCore 使用 ollama 提供 embedding:
 #   - 热层:  MEMORY.md / USER.md (默认 ~/.hermes/memories)
 #   - 冷层:  SQLite (通过 mnemosyne-memory, 默认 ~/.memorycore/data/)
@@ -176,6 +180,7 @@ MemoryCore 采用**单模型 qwen3 架构(无 reranker)**。qwen3 的 dense 分�
 
 ```bash
 # 1. 安装 origin-memorycore(提供冷层引擎 + ColdStoreClient)
+#    (独立 venv 安装; 依赖 mcp>=2,<3, 已知兼容 2.0.0 / 2.2.0)
 pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
 
 # 2. 把插件放入 Hermes 用户插件目录
