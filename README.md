@@ -136,6 +136,39 @@ mcp_servers:
     args: ["-m", "memorycore.server"]
 ```
 
+### Optional LLM enhancement (default OFF)
+
+Hot-tier compression / dormancy judgement / ambiguous-group merge can use an
+optional LLM. Without a key MemoryCore degrades to pure rules (the default and
+always safe). To enable:
+
+```bash
+export LLM_API_KEY="sk-..."                       # required
+export LLM_BASE_URL="https://api.deepseek.com"    # optional, default shown
+export LLM_MODEL="deepseek-v4-flash"              # optional, default shown
+```
+
+Self-check entry:
+
+```bash
+python -m memorycore.llm_check         # zero-network config check
+python -m memorycore.llm_check --live  # verifies auth+connectivity:
+                                       # GET /models first (zero token cost),
+                                       # then a max_tokens=1 completion
+                                       # fallback (~1e-5 yuan, negligible)
+```
+
+By default MemoryCore reads **env vars only**. Reading `~/.hermes/.env` /
+`~/.hermes/config.yaml` (whitelisted keys: `LLM_API_KEY` / `LLM_BASE_URL` /
+`LLM_MODEL` / `DEEPSEEK_API_KEY` / `XIAOMI_API_KEY`) is opt-in via
+`MEMCORE_LLM_FILE_SOURCES=1` — kept off by default so this repo never
+silently picks up a key that belongs to another tool (e.g. Hermes) and starts
+making paid outbound calls. Safety valves: `MEMCORE_LLM_ENABLED=0` (total
+switch), `MEMCORE_LLM_MAX_CALLS` (per-run call cap, default 8),
+`MEMCORE_LLM_COLD_MAX_CALLS` (cold-tier cap), plus fail-backoff — one failed
+call skips the rest of the round. LLM state (unconfigured / resolved /
+verified) is always visible in stats, reports and logs — never silent.
+
 ### Remote mode (optional)
 
 If you prefer a shared remote Mnemosyne MCP service instead of the local

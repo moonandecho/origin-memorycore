@@ -131,6 +131,35 @@ mcp_servers:
     args: ["-m", "memorycore.server"]
 ```
 
+### 可选 LLM 增强(默认关闭)
+
+热层压缩 / 休眠判定 / 模糊组合并可使用可选 LLM。未配置 key 时 MemoryCore
+退化为纯规则(这是默认行为, 且始终安全)。启用方式:
+
+```bash
+export LLM_API_KEY="sk-..."                       # 必填
+export LLM_BASE_URL="https://api.deepseek.com"    # 可选, 缺省值如上
+export LLM_MODEL="deepseek-v4-flash"              # 可选, 缺省值如上
+```
+
+自检入口:
+
+```bash
+python -m memorycore.llm_check         # 零网络配置自检
+python -m memorycore.llm_check --live  # 通路验证: 先 GET /models (零 token 成本),
+                                       # 失败回退 max_tokens=1 completion
+                                       # (费用 ~1e-5 元级, 可忽略)
+```
+
+默认只读环境变量。读取 `~/.hermes/.env` / `~/.hermes/config.yaml`(白名单键:
+`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `DEEPSEEK_API_KEY` /
+`XIAOMI_API_KEY`)需显式 `MEMCORE_LLM_FILE_SOURCES=1` — 默认关闭, 保证本仓库
+不会静默捡起属于其它工具(如 Hermes)的 key 开始计费外呼。安全阀:
+`MEMCORE_LLM_ENABLED=0`(总开关)、`MEMCORE_LLM_MAX_CALLS`(每轮调用上限,
+默认 8)、`MEMCORE_LLM_COLD_MAX_CALLS`(冷层治理独立上限)、失败退避(一轮内
+任一调用失败后剩余候选全部跳过)。LLM 状态(未配置/已解析/已验证)始终可见于
+统计、报告与日志 — 绝不静默。
+
 ### 远程模式(可选)
 
 如果你希望使用共享的远程 Mnemosyne MCP 服务而非本地引擎,设置 `MEMORYCORE_COLD_BACKEND=remote`:
