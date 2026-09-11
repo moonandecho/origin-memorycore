@@ -87,8 +87,12 @@ ollama pull qwen3-embedding:0.6b
 ### Install & run
 
 ```bash
+# 推荐: 用独立 venv 安装 — 不要与其它工具 (如 Hermes) 共用环境,
+# 共用会让 memorycore 的 mcp 版本被别人决定, 宿主升级会连带它启动失败
+python3 -m venv .venv && source .venv/bin/activate
 pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
 
+# 依赖: mcp>=2,<3 (已知兼容 2.0.0 / 2.2.0)
 # That's it! MemoryCore runs with ollama for embeddings:
 #   - Hot tier:  MEMORY.md / USER.md (default ~/.hermes/memories)
 #   - Cold tier: SQLite via mnemosyne-memory (default ~/.memorycore/data/)
@@ -196,6 +200,7 @@ user. A DEBUG-level log records the probe failure.
 
 ```bash
 # 1. install origin-memorycore (provides the cold tier + ColdStoreClient)
+#    (独立 venv 安装; 依赖 mcp>=2,<3, 已知兼容 2.0.0 / 2.2.0)
 pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memorycore.git"
 
 # 2. put the plugin in Hermes' user plugin dir
