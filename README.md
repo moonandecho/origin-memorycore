@@ -31,12 +31,23 @@ Built on the [MCP](https://modelcontextprotocol.io) (Model Context Protocol) `st
 - **Six-step overflow** — capacity baseline → dedup → stale filtering → merge → safe write (cold first, then delete local) → verification.
 - **Cold-tier maintenance** — dedup merge, stale cleanup, conflict resolution, embedding integrity check.
 - **Weekly maintenance (built-in)** — `python -m memorycore.weekly_maintenance` is the standard weekly automation: six-step overflow → smart tidy → cold-tier maintenance → report saved under `logs/`. Smart tidy sinks stale dated history (LLM-confirmed, cold-tier written first) and merges overlapping behavior rules (originals archived to cold tier); protected rules are never deleted. Scheduling is deployment-side (systemd timer / launchd / cron one-liner). Only the notification is optional — set env `MEMORYCORE_NOTIFY_SCRIPT` to pipe the report to your own script; nothing personal is hardcoded.
-- **Hot-tier rule budget (LRU cache model)** — the hot tier is a cache,
-  not a ranking: rules live under a character budget (default 3200) and
-  lifetime is decided by activity, not age. Inactive low-weight rules are
-  evicted to the cold tier as pointer stubs and restored automatically the
-  moment a recall hits them — no rule is permanent (protection is a weight
-  multiplier, never an exemption).
+- **Hot-tier cache policy V2 (2026-09-13)** — the hot tier is a cache, not
+  a ranking: all typed content (rule/state/stub) shares one candidate pool
+  under `RULE_BUDGET_CHARS=2000`; lifetime is decided by activity + budget.
+  Protected entries only get a ×3 sort multiplier (`WEIGHT_PROTECT_MULT=3.0`),
+  never an exemption; a fresh window multiplies rank by `GRACE_MULT=9.0`.
+  Eviction is two-stage: cold write first, then either a ≤40-char pointer
+  stub plus a page-fault restore path (`memorycore_recall(handle=...)`) or,
+  at explicit zero pointer budget, a cold-only delete. `CACHE_POLICY_V2=0`
+  rolls back the candidate-pool semantics; `RULE_MIN_RESIDENCY_DAYS<=0` or
+  `GRACE_MULT<=0` disables only the freshness multiplier.
+- **SAFE-JUDGE v3 typing (2026-09-13)** — deterministic rule/state/ambiguous
+  ternary classification (`core/judge.py`, synchronous path uses zero LLM).
+  Ambiguous entries stay hot under a review deadline instead of being
+  silently sunk; weekly maintenance finalises them via optional LLM review
+  with a 14-day resolved-rule grace. Rollbacks: `JUDGE_V3_ENABLED=0`
+  (`MEMORYCORE_JUDGE_V3_ENABLED`), `JUDGE_AMBIGUOUS_HOLD=0`
+  (`MEMORYCORE_JUDGE_AMBIGUOUS_HOLD`).
 - **Capacity control** — soft threshold (overflow once before writing) / hard threshold (force overflow) / target ratio. Defaults: 60% / 80% / 40% of a 5000-char limit.
 - **Graceful degradation** — cold tier unreachable? Writes fail loudly (never silently dropped), overflow keeps local entries, health check returns local status with `cold.error`.
 - **Zero core modification** — designed as a drop-in companion; your agent's built-in memory tools keep working.
@@ -99,6 +110,11 @@ pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memor
 #   - Embedding: qwen3-embedding:0.6b via ollama (http://localhost:11434/v1)
 python -m memorycore.server          # stdio transport (default)
 ```
+
+**Dependency note** — the Port R1 additions (`memorycore/core/judge.py`,
+cache-policy V2, FIX8 grace multiplier) are pure Python standard library and
+introduce no new runtime dependency. LLM key/file sources remain off by
+default (`MEMCORE_LLM_FILE_SOURCES=0`); see the rollback switches below.
 
 **Data directory layout** (all under `~/.memorycore/`):
 
@@ -184,13 +200,14 @@ Exposed tools:
 
 | Tool | Purpose |
 |---|---|
-| `memorycore_store_fact(content, importance, scope, target)` | Unified write entry: routes cold / hot / stale |
-| `memorycore_recall(query, top_k)` | Actively recall cold-tier memories (read-only, complements per-turn prefetch) |
+| `memorycore_store_entry(content, importance, scope, target, type_hint)` (MCP tool keeps its legacy project-prefixed store name; run `list_tools` to see it) | Unified write entry: routes cold / hot / stale; optional manual `type_hint=state|rule` |
+| `memorycore_recall(query, top_k, handle)` | Actively recall cold-tier memories (read-only, complements per-turn prefetch). `handle` supports direct pointer/page-fault lookup |
 | `memorycore_trigger_overflow(target)` | Run six-step overflow, target ≤40% |
 | `memorycore_run_cold_storage_maintenance()` | Cold-tier governance pass |
 | `memorycore_get_memory_usage()` | Hot-tier usage + cold-tier stats + thresholds |
-| `memorycore_memory_audit(target)` | Hot-tier health check: entry types, age, keep/sink plan, LRU observability, sink candidates |
-| `memorycore_get_rule_weight(target)` | Rule weight distribution (read-only LRU monitor): w_eff, rule_chars vs budget, next eviction candidates |
+| `memorycore_memory_audit(target)` | Hot-tier health check: entry types, age, keep/sink plan, cache-policy observability (`priority`, `in_grace`, `next_evict`), timestamp anomalies |
+| `memorycore_get_rule_weight(target)` | Rule weight distribution (read-only cache monitor): w_eff, unified `priority`/`in_grace`, rule_chars vs budget, selector-accurate next eviction candidates |
+| `memorycore_set_entry_type(target, match_text, type_override, protect_override)` | Manual sidecar-only annotation (`state`/`rule`, protect override); takes effect on the next overflow |
 
 ## Hermes integration — per-turn prefetch
 
@@ -351,41 +368,87 @@ Constants (`memorycore/core/config.py`): `RULE_RETYPE_DAYS=60`,
 `RULE_STUB_IDLE_DAYS=45`, `ACTIVITY_WINDOW_DAYS=30`, `MAX_STUB_PER_RUN=3`,
 `STUB_MAX_CHARS=40`, `IMPORTANCE_PROTECT=0.9`.
 
-### Rule budget — LRU cache model
+> Cache-policy V2 note (2026-09-13): this ladder remains as auxiliary
+> legacy semantics for non-protected typed entries, but the default exit is
+> the unified budget selector described below. In the unified pool S1/S2/S4
+> no longer grant exemptions; protected is a ×3 multiplier and stale-window
+> freshness a ×`GRACE_MULT` multiplier.
 
-Phase 4 (2026-08-26) turns rule retention into a budgeted LRU: the cold
-tier is the full record, the hot tier keeps only what is actively being
-used.
+### Hot-tier cache policy V2 (LRU, 2026-09-13)
 
-- **No permanent rules.** Every rule can retire. Protection is a weight
-  multiplier (×3.0 for A-class / red-line / importance ≥ 0.9), never an
-  exemption — a rule that stops being used decays and eventually leaves.
-- **Character budget.** Rule ecology (rules + stubs) is capped at
-  `RULE_BUDGET_CHARS=3200` (64% of the 5000-char limit). Writes that
-  overflow the budget trigger immediate eviction of the lowest-weight
-  rules (≤3 per run, cold-write-first, confirmed write before any local
-  change).
-- **Activity decides lifetime, not age.** Each overflow run scans the
-  queries logged since the last scan (incremental, local `activity.jsonl`)
-  and embeds them in one batch against cached rule vectors — semantic
-  cosine ≥ `HIT_STRONG_COS=0.48` counts as a strong hit (+1.0, at most once
-  per scan per rule); when the embedding service is unreachable, lexical
-  bigram evidence degrades to a weak hit (+0.3, no anchor refresh). Weight
-  decays with a 30-day half-life since the last strong touch.
-- **Retire to a pointer, restore on use.** Evicted rules go to the cold
-  tier first; a ≤40-char stub keeps the cold_id. When a recall — manual
-  `memorycore_recall` or the per-turn prefetch — hits that cold_id, the
-  full text returns to the hot tier with a fresh weight and a 7-day
-  residency. A rule comes back the moment it is genuinely used again.
-- **Guardrails.** New/restored rules hold a 7-day minimum residency
-  (temporary, not permanent); at most 3 rules are evicted per run; the
-  whole mechanism rolls back with `MEMORYCORE_RULE_BUDGET_ENABLED=0`; and
-  without an activity log the budget layer disables itself, leaving the
-  hard 5000-char limit as the backstop.
+Cache-policy V2 turns hot-tier retention into one unified cache:
 
-Constants (`memorycore/core/config.py`): `RULE_BUDGET_CHARS=3200`,
-`RULE_MIN_RESIDENCY_DAYS=7`, `WEIGHT_HALF_LIFE_DAYS=30`,
-`HIT_STRONG_COS=0.48`, `HIT_WEAK_MODE=degraded`, `MAX_EVICT_PER_RUN=3`.
+- **One candidate pool.** `rule`, `state` and pointer `stub` entries are no
+  longer handled by separate eligibility gates. Every entry participates in
+  the same candidate pool, ordered by a single rank:
+  `w_eff × protected(×3.0) × kw_sink(×0.5) × freshness(×9.0 when within
+  RULE_MIN_RESIDENCY_DAYS)`.
+- **Budget-first eviction.** Rule ecology is capped at
+  `RULE_BUDGET_CHARS=2000` (= `int(CHAR_LIMIT_MEMORY × TARGET_RATIO)`,
+  i.e. the same 40% target as overflow). Eviction is cold-write-first:
+  the local entry changes only after the cold tier confirms, and
+  `MAX_EVICT_PER_RUN=3` bounds full-text evictions per round.
+- **Two-stage output.** A normal eviction leaves a ≤40-char pointer stub
+  (`STUB_MAX_CHARS=40`, handle ≤ `STUB_HANDLE_MAX_CHARS=20`) with the
+  `cold_id`; `memorycore_recall(..., handle="...")` bypasses the semantic
+  threshold, recalls by the stub topic, marks `page_fault=true`, and feeds
+  the write-back/restore path. At explicit `--budget 0` / zero pointer
+  budget the tool goes cold-only: full text is written to the cold tier and
+  the local text is deleted without a pointer (`budget_semantics=
+  T3_cold_only_zero_pointer_budget` in the replay fixture).
+- **No permanent residency.** All-protected / red-line / `importance>=0.9`
+  / `protect_override` entries are still evictable under enough pressure —
+  protection is only the ×3 multiplier. Pinned stress case:
+  `tests/test_cache_policy_v2.py::test_no_permanent_residency_all_protected`.
+- **Freshness is a multiplier, not an exemption.**
+  `RULE_MIN_RESIDENCY_DAYS=7` covers `written_at` / `last_recall_hit_at`
+  through the shared `_ts_anchor` time entry; inside that window rank ×
+  `GRACE_MULT=9.0` (calibrated in the design with the bundled synthetic
+  R2 snapshot fixture, 25 entries; `tools/residency_dryrun.py` reproduces
+  the fresh-window ordering). It is still fully evictable when pressure
+  is sufficient.
+- **Activity decides lifetime, not age.** Weight starts at
+  `WEIGHT_INIT=1.0`, decays with a 30-day half-life, gains +1.0 on a strong
+  semantic hit (`HIT_STRONG_COS=0.48`, one increment per scan per rule) or
+  +0.3 weak hit when embedding is unavailable, and is capped at
+  `WEIGHT_MAX=5.0`. Default kw-sinkable content gets
+  `WEIGHT_KWSINK_MULT=0.5`.
+
+### SAFE-JUDGE v3 (2026-09-13)
+
+`memorycore/core/judge.py` replaces the old sequence of lexical
+`classify()` + `should_keep_local()` double judgements with one
+deterministic ternary verdict:
+
+- `state` → cold migration (cold-write-first);
+- `rule` → hot, stamped with `judge_v3` audit fields;
+- `ambiguous` → force hot, write `judge_review_at` (`+7d` first review,
+  `JUDGE_AMBIGUOUS_LRU_DAYS=21` A1 pointer fallback, max 2 reviews). The
+  synchronous typing path calls no LLM; only weekly maintenance may spend
+  one explicitly recorded LLM confirmation. A final `rule` verdict gets a
+  `JUDGE_RESOLVED_RULE_GRACE_DAYS=14` audit grace.
+- Strong rule and ambiguous content are force-kept hot at the write
+  entrance; ambiguous local-write failure returns an error instead of a
+  silent cold fallback (`DESIGN-DEVIATIONS.md` §6.5).
+
+### Rollback / kill switches
+
+| Switch | Default | Effect |
+|---|---|---|
+| `MEMORYCORE_CACHE_POLICY_V2=0` | `1` | Restore the legacy qualified candidate pool (protected eligibility exemption / age gates) while keeping cold-write-first. `PROTECT_SKIP_LRU=1` only warns (deprecated). |
+| `RULE_MIN_RESIDENCY_DAYS <= 0` | `7` | Disable only the fresh-window multiplier (exact legacy pure-rank ordering). |
+| `GRACE_MULT <= 0` | `9.0` | Same rollback as above at the rank multiplier entry. |
+| `MEMORYCORE_RULE_BUDGET_ENABLED=0` | `1` | Disable the rule-budget eviction layer (hard 5000-char backstop still applies). |
+| `MEMORYCORE_JUDGE_V3_ENABLED=0` | `1` | Return to lexical v2 typing (`CLASSIFIER_V2_ENABLED` selects v2/v1); known attack baseline 20/29. |
+| `MEMORYCORE_JUDGE_AMBIGUOUS_HOLD=0` | `1` | Treat ambiguous as rule (binary behaviour, no review deadline / no hot hold). |
+| `MEMCORE_LLM_FILE_SOURCES=1` | `0` | Opt in to whitelisted `~/.hermes/.env` / `config.yaml` LLM file sources; never on by default. |
+
+Constants (`memorycore/core/config.py`): `RULE_BUDGET_CHARS=2000`,
+`INDEX_BUDGET_CHARS=800`, `RULE_MIN_RESIDENCY_DAYS=7`, `GRACE_MULT=9.0`,
+`WEIGHT_INIT=1.0`, `WEIGHT_PROTECT_MULT=3.0`, `WEIGHT_KWSINK_MULT=0.5`,
+`WEIGHT_HALF_LIFE_DAYS=30`, `HIT_STRONG_COS=0.48`, `MAX_EVICT_PER_RUN=3`,
+`MAX_STUB_PER_RUN=3`, `STUB_MAX_CHARS=40`, `JUDGE_AMBIGUOUS_REVIEW_DAYS=7`,
+`JUDGE_AMBIGUOUS_LRU_DAYS=21`, `JUDGE_RESOLVED_RULE_GRACE_DAYS=14`.
 
 ### Health check: memorycore_memory_audit
 
@@ -444,6 +507,34 @@ untouched, behaviour is predictable and reversible.
 > 9920 filler memories in daily-log tone, same config as production);
 > production data was untouched.
 
+## Reproducible synthetic fixtures
+
+The release tree ships neutral synthetic fixtures under
+`tests/fixtures/synthetic/` (25 `notehub` rules: 19 rule + exactly 6
+completed/history state entries; 5 USER entries; sidecar metadata; 409
+realistic timestamped activity queries — short paraphrases, lexical-only
+follow-ups, genuine off-topic noise, gated low-information messages, and
+action commands; no rule text is copied into queries). No production memory is
+required to run the fixture-backed acceptance paths. Rebuild the derived silver fixture with the
+bundled one-shot generator:
+
+```bash
+.venv/bin/python tools/build_fault_replay_fixture.py \
+  --activity tests/fixtures/synthetic/activity.jsonl \
+  --rules    tests/fixtures/synthetic/MEMORY.md \
+  --out      tests/fixtures/fault_replay_silver.json
+```
+
+Verified synthetic baselines:
+
+| Check | Result |
+|---|---|
+| fault replay (`replay_fault_rate.py`) | `hits=186/200 faults=14 fault_rate=7.0% baseline=41.5% relative_drop=83.1% pass=True` (R3 realistic synthetic activity; fixture is reproducible synthetic, values differ from production) |
+| retype dry-run on synthetic snapshot | `19 rule / 6 state`, state set exactly the 6 bundled targets |
+| migration water level | `2598 / 5000 chars (51%)` |
+| snapshot budget replay | `--budget 2000` and `--budget 0` both EXIT=0 |
+| residency dry-run | 25 entries / 3441 chars / need 1441, `need_satisfied=True`, `new_evictable_when_full=True` |
+
 ## Notes for sqlite-vec users
 
 If you enable sqlite-vec vector indexing for the Mnemosyne cold tier, be aware
@@ -481,6 +572,11 @@ See [examples/cold-store-contract.md](examples/cold-store-contract.md) for the f
 | `MEMORY_DIR` | `~/.hermes/memories` | Hot-tier directory (`MEMORY.md` / `USER.md`) |
 | `ACTIVITY_LOG_ENABLED` | `1` | Query-activity log for topic-activity signals; `0` disables the log and S4 stub-sink entirely |
 | `MNEMOSYNE_TIMEOUT` | `10.0` | Cold-tier request timeout (remote mode, seconds) |
+| `MEMORYCORE_CACHE_POLICY_V2` | `1` | Unified cache candidate pool; `0` restores legacy qualified pool |
+| `MEMORYCORE_RULE_BUDGET_ENABLED` | `1` | Rule-budget eviction layer; `0` disables (hard 5000-char backstop remains) |
+| `MEMORYCORE_JUDGE_V3_ENABLED` | `1` | SAFE-JUDGE v3 ternary typing; `0` rolls back to lexical v2 |
+| `MEMORYCORE_JUDGE_AMBIGUOUS_HOLD` | `1` | Ambiguous entries stay hot under review deadline; `0` treats them as rule |
+| `MEMCORE_LLM_FILE_SOURCES` | `0` | Opt-in to whitelisted `~/.hermes/.env` / `config.yaml`; never on by default |
 
 Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_THRESHOLD`, `HARD_THRESHOLD`, `TARGET_RATIO`).
 

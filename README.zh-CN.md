@@ -16,7 +16,7 @@ Agent 积累记忆的速度很快——偏好、事实、决策——而不维�
 - **写入时去重** —— 通过全角→半角归一化、空白折叠、标点后空格删除 (`normalize_for_compare`) 后再比较去重;写入仍保留原始内容。
 - **容量控制** —— 软/硬阈值在热层写满之前触发溢流,让它永不拒绝写入。
 - **冷层治理** —— 周期性去重/清理,让冷层在增长中保持可检索。
-- **回收站** —— 被删除的条目有 30 天宽限期;召回一条被回收的记忆即可复活它。
+- **回收队列** —— 被删除的条目有 30 天宽限期;召回一条被回收的记忆即可复活它。
 
 结果:热层保持在预算内,冷层保持可检索,无论 Agent 积累多少记忆,记忆始终可维护。
 
@@ -28,10 +28,22 @@ Agent 积累记忆的速度很快——偏好、事实、决策——而不维�
   - **冷层写入去重**:写入冷层前,语义召回 + LLM 判断检查重复,更新已有条目而非创建冗余。
   - **热层去重归一化**:`normalize_for_compare` 执行全角→半角转换、空白折叠、标点后空格删除——确保去重在 CJK 标点变体和输入噪声下依然有效。写入始终保留原始内容。
   - **容量硬闸**:冷层强制软上限(6000 条,触发一次治理)和硬上限(10000 条,强制治理循环)——防止无界增长。
-  - **回收站**(`trash_store.py`):被删除的冷层条目移入 `~/.memorycore/trash.json`,30 天过期。召回被回收的条目时,若带有新的语义证据则恢复("召回即复活")。
+  - **回收队列**(`trash_store.py`):被删除的冷层条目移入 `~/.memorycore/trash.json`,30 天过期。召回被回收的条目时,若带有新的语义证据则恢复("召回即复活")。
 - **冷/热路由** —— 每次写入都被分类:高重要度或偏好类 → 热层(本地);低频事实 → 冷层(远程);过时状态记录 → 丢弃。
 - **六步溢流** —— 容量基线 → 去重 → 过时过滤 → 合并 → 安全写入(先写冷层,再删本地)→ 验证。
 - **冷层治理** —— 去重合并、过时清理、冲突消解、embedding 完整性检查。
+- **热层缓存策略 V2(2026-09-13)** —— 热层是缓存而非排序:rule/state/stub
+  统一进入同一候选池,预算 `RULE_BUDGET_CHARS=2000`;寿命由活性 + 预算决定。
+  protected 只是 ×3 排序乘数(`WEIGHT_PROTECT_MULT=3.0`),不是豁免;新鲜窗口
+  再乘 `GRACE_MULT=9.0`。换出两阶段:先确认冷层写入,再留 ≤40 字指针 stub,
+  通过 `memorycore_recall(handle=...)` 缺页写回;显式 0 指针预算时走 cold-only
+  删除。`CACHE_POLICY_V2=0` 回滚候选池语义;`RULE_MIN_RESIDENCY_DAYS<=0` 或
+  `GRACE_MULT<=0` 只关闭新鲜乘数。
+- **SAFE-JUDGE v3 判型(2026-09-13)** —— `core/judge.py` 三态判型
+  rule/state/ambiguous;同步路径零 LLM。ambiguous 不再静默下沉,而是留热层
+  进入复审期限,周治理可用一次显式 LLM 终审;终审为 rule 给 14 天审计宽限。
+  回滚:`JUDGE_V3_ENABLED=0`(`MEMORYCORE_JUDGE_V3_ENABLED`)、
+  `JUDGE_AMBIGUOUS_HOLD=0`(`MEMORYCORE_JUDGE_AMBIGUOUS_HOLD`)。
 - **每周治理(内置)** —— `python -m memorycore.weekly_maintenance` 是标准周度自动化:六步溢流 → 智能整理 → 冷层治理 → 报告落盘 `logs/`。智能整理将过时历史(LLM 确认、先写冷层)下沉、将重叠行为准则合并(原文先归档冷层);受保护准则绝不删除。调度由部署侧负责(systemd timer / launchd / cron)。仅通知为可选:设置环境变量 `MEMORYCORE_NOTIFY_SCRIPT` 将报告传给自有脚本;代码不内置任何个人信息。
 - **容量控制** —— 软阈值(写入前溢流一次)/ 硬阈值(强制溢流)/ 目标比例。默认:5000 字符限制的 60% / 80% / 40%。
 - **优雅降级** —— 冷层不可达?写入大声失败(绝不静默丢弃),溢流保留本地条目,健康检查返回本地状态并标注 `cold.error`。
@@ -95,6 +107,10 @@ pip install "origin-memorycore @ git+https://github.com/moonandecho/origin-memor
 #   - Embedding: qwen3-embedding:0.6b (通过 ollama, http://localhost:11434/v1)
 python -m memorycore.server          # stdio 传输 (默认)
 ```
+
+**依赖说明** —— Port R1 新增的 `memorycore/core/judge.py`、缓存策略 V2 与
+FIX8 换挡全部只依赖 Python 标准库, 不新增运行时依赖。LLM key/文件来源默认
+关闭 (`MEMCORE_LLM_FILE_SOURCES=0`); 回滚开关见下文。
 
 **数据目录布局**(全部位于 `~/.memorycore/` 下):
 
@@ -174,13 +190,14 @@ python -m memorycore.server
 
 | 工具 | 用途 |
 |---|---|
-| `memorycore_store_fact(content, importance, scope, target)` | 统一写入入口:路由冷 / 热 / 过时 |
-| `memorycore_recall(query, top_k)` | 主动召回冷层记忆(只读,补充每轮 prefetch) |
+| `memorycore_store_entry(content, importance, scope, target, type_hint)`(MCP 工具仍保留项目前缀的旧名称,可用 `list_tools` 查看) | 统一写入入口:路由冷 / 热 / 过时;可选 `type_hint=state|rule` 人工判型 |
+| `memorycore_recall(query, top_k, handle)` | 主动召回冷层记忆(只读,补充每轮 prefetch);`handle` 支持指针直查/缺页路径 |
 | `memorycore_trigger_overflow(target)` | 执行六步溢流,目标 ≤40% |
 | `memorycore_run_cold_storage_maintenance()` | 冷层治理流程 |
 | `memorycore_get_memory_usage()` | 热层用量 + 冷层统计 + 阈值 |
 | `memorycore_memory_audit(target)` | 热层体检:条目类型/年龄/keep/sink 判定/LRU 观测/sink 候选 |
-| `memorycore_get_rule_weight(target)` | 规则权重分布(只读 LRU 监控):w_eff、字符vs预算、下一批退役候选 |
+| `memorycore_get_rule_weight(target)` | 规则权重分布(只读缓存监控):w_eff、统一 `priority`/`in_grace`、字符vs预算、与实际选择器一致的下一批退役候选 |
+| `memorycore_set_entry_type(target, match_text, type_override, protect_override)` | 人工标注(只写 sidecar,不改 .md),下次溢流按标注接管 |
 
 ## Hermes 集成 —— 每轮主动召回 prefetch
 
@@ -299,6 +316,61 @@ hermes config set memory.provider memorycore-prefetch
 `RULE_STUB_IDLE_DAYS=45`、`ACTIVITY_WINDOW_DAYS=30`、`MAX_STUB_PER_RUN=3`、
 `STUB_MAX_CHARS=40`、`IMPORTANCE_PROTECT=0.9`。
 
+### 热层缓存策略 V2(LRU,2026-09-13)
+
+- **统一候选池**:`rule`/`state`/指针 `stub` 不再分档,全部进入同一排序池:
+  `w_eff × protected(×3.0) × kw_sink(×0.5) × 新鲜窗口(×9.0)`。
+- **预算硬约束**:规则生态 `RULE_BUDGET_CHARS=2000`(与 40% 目标同源);
+  换出一律先冷层写成功;单轮全文换出 ≤ `MAX_EVICT_PER_RUN=3`。
+- **两阶段换出**:普通路径留 ≤40 字指针(`STUB_MAX_CHARS=40`,句柄
+  `STUB_HANDLE_MAX_CHARS=20`)+ `cold_id`;`memorycore_recall(handle=...)`
+  绕过阈值直查并标记 `page_fault`,驱动写回恢复;显式 0 指针预算时全文冷写
+  成功后直接删本地(`--budget 0` / T3 cold-only)。
+- **无永久驻留**:全 protected / 红线 / importance≥0.9 / `protect_override`
+  在足够压力下仍可换出;固定压测:
+  `tests/test_cache_policy_v2.py::test_no_permanent_residency_all_protected`。
+- **新鲜窗口是排序乘数**:`RULE_MIN_RESIDENCY_DAYS=7`,`written_at` /
+  `last_recall_hit_at` 经 `_ts_anchor` 统一入口;窗口内 ×`GRACE_MULT=9.0`
+  (设计用 bundled R2 合成快照夹具标定,25 条;`tools/residency_dryrun.py`
+  可复现新鲜窗口排序),压力足够仍可换出。
+- **活性参数**:`WEIGHT_INIT=1.0`,半衰期 30 天,强命中 +1.0
+  (`HIT_STRONG_COS=0.48`),弱命中 +0.3,封顶 `WEIGHT_MAX=5.0`,
+  kw-sink 乘数 `WEIGHT_KWSINK_MULT=0.5`。
+
+### SAFE-JUDGE v3 判型(2026-09-13)
+
+`memorycore/core/judge.py` 用一次确定性三态判型替代旧的
+`classify()` + `should_keep_local()` 双判:
+
+- `state` → 冷迁移(冷写成功才删本地);
+- `rule` → 留热层,写 `judge_v3` 审计字段;
+- `ambiguous` → 强制留热层,写 `judge_review_at`(首审 +7 天,
+  `JUDGE_AMBIGUOUS_LRU_DAYS=21` A1 指针兜底,最多 2 次复审)。同步判型零
+  LLM,只有周治理可发起一次显式 LLM 终审;终审为 rule 给
+  `JUDGE_RESOLVED_RULE_GRACE_DAYS=14` 审计宽限。
+- strong rule 与 ambiguous 在写入口强制 hot;ambiguous 本地写失败直接报错,
+  不允许静默冷迁兜底(`DESIGN-DEVIATIONS.md` §6.5)。
+
+### 回滚开关
+
+| 开关 | 默认 | 效果 |
+|---|---|---|
+| `MEMORYCORE_CACHE_POLICY_V2=0` | `1` | 回退旧资格候选池(protected 资格豁免/年龄门),冷写安全铁律不变;`PROTECT_SKIP_LRU=1` 仅告警(已废弃) |
+| `RULE_MIN_RESIDENCY_DAYS <= 0` | `7` | 只关闭新鲜窗口乘数(等价旧纯 rank 排序) |
+| `GRACE_MULT <= 0` | `9.0` | 同上,排序乘数入口关闭 |
+| `MEMORYCORE_RULE_BUDGET_ENABLED=0` | `1` | 关闭规则预算换出层(仍受硬 5000 字兜底) |
+| `MEMORYCORE_JUDGE_V3_ENABLED=0` | `1` | 回退词法 v2 判型(`CLASSIFIER_V2_ENABLED` 决定 v2/v1),attack 基线 20/29 |
+| `MEMORYCORE_JUDGE_AMBIGUOUS_HOLD=0` | `1` | ambiguous 当 rule(二值行为,不写复审期限) |
+| `MEMCORE_LLM_FILE_SOURCES=1` | `0` | 选择性开启白名单 `~/.hermes/.env` / `config.yaml` 文件来源,默认绝不开 |
+
+常量(`memorycore/core/config.py`):`RULE_BUDGET_CHARS=2000`、
+`INDEX_BUDGET_CHARS=800`、`RULE_MIN_RESIDENCY_DAYS=7`、`GRACE_MULT=9.0`、
+`WEIGHT_INIT=1.0`、`WEIGHT_PROTECT_MULT=3.0`、`WEIGHT_KWSINK_MULT=0.5`、
+`WEIGHT_HALF_LIFE_DAYS=30`、`HIT_STRONG_COS=0.48`、`MAX_EVICT_PER_RUN=3`、
+`MAX_STUB_PER_RUN=3`、`STUB_MAX_CHARS=40`、
+`JUDGE_AMBIGUOUS_REVIEW_DAYS=7`、`JUDGE_AMBIGUOUS_LRU_DAYS=21`、
+`JUDGE_RESOLVED_RULE_GRACE_DAYS=14`。
+
 ### 体检工具: memorycore_memory_audit
 
 只读工具,列出热层每条条目的类型、年龄、退役计划与 keep/sink 判定,并附带
@@ -339,6 +411,32 @@ MemoryCore 在万条级冷层规模下做了完整压力测试与召回优化(�
 
 > 注:测试在 10k 条合成库上进行(80 条"黄金记忆"+ 9920 条日常口吻填充记忆,与生产同配置),生产数据零污染。
 
+## 可复现合成夹具
+
+发布树在 `tests/fixtures/synthetic/` 提供中性合成夹具（25 条 `notehub` 规则：
+19 rule + 恰好 6 条完成态/历史 state；5 条 USER 示例；配套 sidecar 元数据；
+409 条写实分布的带时间戳查询：短问句改写、低重叠语义问法、真正无关噪声、
+会被 F1 闸门挡掉的低信息短句与动作型指令，且不把规则原文抄进查询）。
+依赖夹具的验收路径不读取任何生产记忆。用 bundled
+一次性生成器重建 silver 回放夹具：
+
+```bash
+.venv/bin/python tools/build_fault_replay_fixture.py \
+  --activity tests/fixtures/synthetic/activity.jsonl \
+  --rules    tests/fixtures/synthetic/MEMORY.md \
+  --out      tests/fixtures/fault_replay_silver.json
+```
+
+合成语料上复测基线：
+
+| 检查项 | 结果 |
+|---|---|
+| 缺页率回放（`replay_fault_rate.py`） | `hits=186/200 faults=14 fault_rate=7.0% baseline=41.5% relative_drop=83.1% pass=True`（R3 写实合成语料；夹具可复现，与生产语料数值不同） |
+| 合成快照 retype 干跑 | `19 rule / 6 state`，state 集合恰为 6 条 bundled 目标 |
+| 迁移后水位 | `2598 / 5000 chars（51%）` |
+| 快照预算回放 | `--budget 2000` 与 `--budget 0` 均 EXIT=0 |
+| 驻留干跑 | 25 条 / 3441 chars / need 1441，`need_satisfied=True`、`new_evictable_when_full=True` |
+
 ## sqlite-vec 用户注意事项
 
 如果你为 Mnemosyne 冷层启用 sqlite-vec 向量索引,请注意 `beam.py` 的 `_wm_vec_search_sqlite` 使用原始相似度公式 `sim = 1 - distance / (2 * EMBEDDING_DIM)`,会把 float32 距离压缩到 ~1.0,使动态阈值实际失效(所有结果都通过)。
@@ -371,6 +469,11 @@ MemoryCore 在万条级冷层规模下做了完整压力测试与召回优化(�
 | `MEMORY_DIR` | `~/.hermes/memories` | 热层目录(`MEMORY.md` / `USER.md`) |
 | `ACTIVITY_LOG_ENABLED` | `1` | 查询活动日志(主题活性信号采集);设为 `0` 关闭日志并整体禁用 S4 stub-sink |
 | `MNEMOSYNE_TIMEOUT` | `10.0` | 冷层请求超时(远程模式,秒) |
+| `MEMORYCORE_CACHE_POLICY_V2` | `1` | 统一缓存候选池;`0` 回退旧资格池 |
+| `MEMORYCORE_RULE_BUDGET_ENABLED` | `1` | 规则预算换出层;`0` 关闭(仍受硬 5000 字兜底) |
+| `MEMORYCORE_JUDGE_V3_ENABLED` | `1` | SAFE-JUDGE v3 三态判型;`0` 回退词法 v2 |
+| `MEMORYCORE_JUDGE_AMBIGUOUS_HOLD` | `1` | ambiguous 复审期限内留热;`0` 当 rule 处理 |
+| `MEMCORE_LLM_FILE_SOURCES` | `0` | 选择性开启白名单 `~/.hermes/.env` / `config.yaml`,默认关闭 |
 
 容量常量位于 `memorycore/core/config.py`(`CHAR_LIMIT_*`、`SOFT_THRESHOLD`、`HARD_THRESHOLD`、`TARGET_RATIO`)。
 
