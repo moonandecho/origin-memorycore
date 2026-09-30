@@ -77,6 +77,28 @@ Agent 积累记忆的速度很快——偏好、事实、决策——而不维�
   └───────────────────────────────────────────────────────────────────────┘
 ```
 
+## 冷层引擎 (mnemosyne) 与其补丁
+
+冷层就是上游 MIT 包 [`mnemosyne-memory`](https://github.com/AxDSan/mnemosyne)，由
+`cold_store_client.py` 进程内直接调用 (`LocalBackend`)，或经 MCP 走 `RemoteBackend`。
+我们运行的是它的**本地补丁版**，`patches/` 把这套补丁公开出来，任何人都能从公开包重现
+我们跑的引擎：
+
+```bash
+deploy/install-engine.sh     # 锁定上游 3.15.1、应用补丁序列、检查 reject
+```
+
+* `patches/README.md` 说明每个补丁改了什么、以及如何验证结果。
+* `deploy/` 提供 systemd 样例、环境变量文件，以及暴露引擎工具面的 MCP 入口：
+  `remember`、`recall`、`update`、`forget`、`stats`、`list_all`、`embed_texts`。
+
+`patches/0002-engine-rework.patch` 这版改造做了三件事：召回收窄到调用方所属域
+(`scope='global'` 不再跨域放大可见性)、在域内对候选集做读侧封顶、以及新增一个可选的新
+内核 schema（自带 `vector_store` 表，使向量路径不再依赖旧的 `memories` /
+`working_memory` 联表）。这套补丁不改变上面列出的任何工具面。
+
+我们**不公开引擎的性能数字**：那些数字来自单机单一语料，对别人的负载几乎没有参考价值。
+
 ## 快速开始
 
 ### 前置依赖

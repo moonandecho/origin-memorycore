@@ -1,0 +1,460 @@
+diff -ruN a/mnemosyne/core/beam.py b/mnemosyne/core/beam.py
+--- a/mnemosyne/core/beam.py	2026-07-30 17:03:20.000000000 +0800
++++ b/mnemosyne/core/beam.py	2026-09-30 18:41:23.793426026 +0800
+@@ -835,10 +835,13 @@
+     """)
+ 
+     # --- FTS5 VIRTUAL TABLE for working memory (autonomous) ---
++    # 2026-08-05: tokenize='trigram' 支持中文 3 字以上短语索引。
++    # 2 字词 trigram 不匹配, 由 _cjk_like_search 兜底 (见 _fts_search_working)。
+     cursor.execute("""
+         CREATE VIRTUAL TABLE IF NOT EXISTS fts_working USING fts5(
+             id UNINDEXED,
+-            content
++            content,
++            tokenize='trigram'
+         )
+     """)
+ 
+@@ -1747,6 +1750,19 @@
+     "current": ("now", "live", "latest"),
+     "feeling": ("feel", "feels"),
+     "imposter": ("self-doubt", "doubt", "insecure"),
++    # 2026-08-05 中文同义词 (用户场景常用口语 -> 存储用词)。保守, 只加高频等价。
++    "反向代理": ("nginx", "代理", "proxy"),
++    "显存": ("vram", "显卡内存", "gpu显存"),
++    "冷层": ("长期记忆", "冷存储", "mnemosyne"),
++    "热层": ("短期记忆", "本地记忆", "memory"),
++    "服务器": ("主机", "机器"),
++    "备份": ("快照", "归档", "backup"),
++    "驱动": ("显卡驱动", "nvidia驱动", "driver"),
++    "升级": ("更新", "升级到", "update"),
++    "配置": ("设置", "安装", "部署"),
++    "查询": ("检索", "搜索", "召回"),
++    "审查": ("评审", "审核", "review"),
++    "记忆": ("memory", "回忆", "召回"),
+ }
+ 
+ 
+@@ -1817,6 +1833,24 @@
+     return expanded
+ 
+ 
++# --- MemoryCore patch 001 (2026-09-18): configurable recall-scoring knobs ---
++# Upstream hard-codes three things that our evaluation wanted to sweep. All
++# three defaults reproduce the upstream behaviour exactly.
++#   MNEMOSYNE_LEX_GATE_SCALE   scales the lexical gate (0.15/0.3/0.5); 1.0 = upstream, 0.0 = admit all
++#   MNEMOSYNE_VEC_ADMIT_MIN    admit a row whose vector similarity >= this, even with no lexical overlap (0.0 = off)
++#   MNEMOSYNE_VEC_SCORE_WEIGHT blend weight of vector similarity in the wm score (upstream 0.20)
++def _env_float(name: str, default: float) -> float:
++    try:
++        raw = os.environ.get(name, "")
++        return float(raw) if raw not in (None, "") else default
++    except (TypeError, ValueError):
++        return default
++
++
++_LEX_GATE_SCALE = _env_float("MNEMOSYNE_LEX_GATE_SCALE", 1.0)
++_VEC_ADMIT_MIN = _env_float("MNEMOSYNE_VEC_ADMIT_MIN", 0.0)
++_VEC_SCORE_WEIGHT = _env_float("MNEMOSYNE_VEC_SCORE_WEIGHT", 0.20)
++
+ def _minimum_recall_relevance(query_tokens: List[str]) -> float:
+     """Raise the lexical gate for broad natural-language queries.
+ 
+@@ -1824,10 +1858,15 @@
+     for broad nonsense strings like "purple bicycle quantum oatmeal".
+     """
+     if len(query_tokens) >= 4:
+-        return 0.3
+-    if len(query_tokens) == 3:
+-        return 0.5
+-    return 0.15
++        base = 0.3
++    elif len(query_tokens) == 3:
++        base = 0.5
++    else:
++        base = 0.15
++    # patch 001: gate is lexical-only, so a semantically relevant row with no
++    # literal token overlap never reaches scoring. MNEMOSYNE_LEX_GATE_SCALE
++    # scales the thresholds (1.0 = upstream, 0.0 = admit every candidate).
++    return base * _LEX_GATE_SCALE
+ 
+ 
+ _CURRENT_STATE_QUERY_TOKENS = {"current", "currently", "latest", "now", "newer"}
+@@ -2096,7 +2135,7 @@
+     results = []
+     for row in rows:
+         try:
+-            vec = np.array(json.loads(row["embedding_json"]), dtype=np.float32)
++            vec = _embeddings.deserialize(row["embedding_json"])
+             vec_norm = np.linalg.norm(vec)
+             if vec_norm == 0:
+                 continue
+@@ -2221,6 +2260,8 @@
+     vector keyed by ``working_memory.rowid``.
+     """
+     emb_for_json = np.array(embedding, dtype=np.float32) if np is not None else embedding
++    # 2026-08-05 BLOB 化: serialize 返回 float32 BLOB (4KB), 替代 JSON 文本 (22KB)。
++    # 读取端 deserialize 兼容旧 JSON 数据 (见 _embeddings.deserialize)。
+     emb_json = _embeddings.serialize(emb_for_json)
+     inserted = conn.execute(
+         """
+@@ -2258,7 +2299,7 @@
+     inserted = 0
+     for row in rows:
+         try:
+-            embedding = json.loads(row["embedding_json"])
++            embedding = _embeddings.deserialize(row["embedding_json"])
+             _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
+             inserted += 1
+         except Exception as exc:
+@@ -2922,7 +2963,15 @@
+         # by backend/vector type; divide by dimensionality before bounding so
+         # the vector voice remains comparable to the memory_embeddings cosine
+         # fallback instead of collapsing to ~0 on high-dimensional vectors.
+-        sim = max(0.0, min(1.0, 1.0 - (max(distance, 0.0) / (2.0 * EMBEDDING_DIM))))
++        if vec_type == "float32":
++            # float32 stores raw (normalized) vectors: L2 distance d maps to
++            # cosine = 1 - d^2/2 exactly for unit vectors. Keep the score
++            # comparable to the memory_embeddings numpy-cosine fallback so
++            # downstream thresholds (prefetch water-level baseline) stay valid.
++            sim = max(0.0, min(1.0, 1.0 - (max(distance, 0.0) ** 2) / 2.0))
++        else:
++            # int8/bit quantized: distance scale differs; keep original formula
++            sim = max(0.0, min(1.0, 1.0 - (max(distance, 0.0) / (2.0 * EMBEDDING_DIM))))
+         results.append({"id": row["id"], "sim": sim})
+     return results[:k]
+ 
+@@ -2956,7 +3005,7 @@
+     results = []
+     for row in rows:
+         try:
+-            vec = np.array(json.loads(row["embedding_json"]), dtype=np.float32)
++            vec = _embeddings.deserialize(row["embedding_json"])
+             vec_norm = np.linalg.norm(vec)
+             if vec_norm == 0:
+                 continue
+@@ -4074,9 +4123,7 @@
+         emb_map = {}
+         for row in cursor.fetchall():
+             try:
+-                emb_map[row["memory_id"]] = np.array(
+-                    json.loads(row["embedding_json"]), dtype=np.float32
+-                )
++                emb_map[row["memory_id"]] = _embeddings.deserialize(row["embedding_json"])
+             except Exception:
+                 continue
+ 
+@@ -5463,6 +5510,7 @@
+                fts_weight: float = None,
+                importance_weight: float = None,
+                explain: bool = False,
++               bump_recalled: bool = True,
+                _cross_session: Optional[bool] = None) -> List[Dict]:
+         """
+         Hybrid recall across working_memory + episodic_memory.
+@@ -5532,6 +5580,7 @@
+                 channel_id=channel_id,
+                 veracity=veracity, memory_type=memory_type,
+                 cross_session=cross_session,
++                bump_recalled=bump_recalled,
+             )
+             if explain:
+                 return {
+@@ -5647,7 +5696,7 @@
+ 
+         # ---- Working memory (FTS5 fast path) ----
+         try:
+-            wm_fts = _fts_search_working(self.conn, query, k=max(top_k * 3, 50))
++            wm_fts = _fts_search_working(self.conn, query, k=max(top_k * 4, 300))  # 2026-08-05 大库修复
+         except Exception:
+             wm_fts = []
+         _wm_fts_raw_count = len(wm_fts)
+@@ -5713,7 +5762,7 @@
+                 emb_result = _get_query_embedding()
+                 if emb_result is not None:
+                     wm_vec = _wm_vec_search(self.conn, emb_result,
+-                                              k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50),
++                                              k=max(top_k * 4, 300),  # 2026-08-05 大库修复: 候选截断 20→300 (短查询高密度召回), 本地接管不随上游
+                                               where_sql=wm_where,
+                                               where_params=tuple(wm_params))
+                     for vr in wm_vec:
+@@ -5797,7 +5846,12 @@
+             else:
+                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
+                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
+-            if relevance >= row_min_relevance or (wm_ranks and len(query_words) <= 1 and relevance > 0):
++            if (relevance >= row_min_relevance
++                    or (wm_ranks and len(query_words) <= 1 and relevance > 0)
++                    # patch 001: vector-similarity escape hatch (off by default);
++                    # the episodic path already has one (see sim < 0.65 above).
++                    or (_VEC_ADMIT_MIN > 0.0
++                        and wm_vec_sims.get(row["id"], 0.0) >= _VEC_ADMIT_MIN)):
+                 decay = _recency_decay(row["timestamp"])
+                 # Phase 4: configurable scoring for working memory
+                 # keyword_share = (1 - importance_weight) * 0.6, recency_share = (1 - importance_weight) * 0.4
+@@ -5807,7 +5861,9 @@
+                 # Blend vector similarity into working memory score (weighted toward keyword precision)
+                 vec_sim = wm_vec_sims.get(row["id"], 0.0)
+                 if vec_sim > 0:
+-                    base_score = base_score * 0.80 + vec_sim * 0.20
++                    # patch 001: 0.80/0.20 -> (1 - MNEMOSYNE_VEC_SCORE_WEIGHT)/weight
++                    base_score = (base_score * (1.0 - _VEC_SCORE_WEIGHT)
++                                  + vec_sim * _VEC_SCORE_WEIGHT)
+                 score = base_score * (rc_share + (1.0 - rc_share) * decay)
+                 score += _current_state_recency_bonus(query_words, row["content"])
+                 # Temporal boost (Phase 3)
+@@ -6129,10 +6185,10 @@
+             emb_result = _get_query_embedding()
+             if emb_result is not None:
+                 if _vec_available(self.conn):
+-                    vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
++                    vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 4, 300))  # 2026-08-05 大库修复
+                 else:
+                     # Fallback: in-memory cosine similarity search
+-                    vec_rows = _in_memory_vec_search(self.conn, emb_result, k=max(top_k * 3, 20))
++                    vec_rows = _in_memory_vec_search(self.conn, emb_result, k=max(top_k * 4, 300))  # 2026-08-05 大库修复
+                 if vec_rows:
+                     max_distance = max(vr["distance"] for vr in vec_rows)
+                     for vr in vec_rows:
+@@ -6140,7 +6196,7 @@
+                         vec_results[vr["rowid"]] = sim
+ 
+         fts_results = {}
+-        fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
++        fts_rows = _fts_search(self.conn, query, k=max(top_k * 4, 300))  # 2026-08-05 大库修复
+         _em_fts_raw_count = len(fts_rows)
+         if fts_rows:
+             min_rank = min(r["rank"] for r in fts_rows)
+@@ -6607,42 +6663,45 @@
+         _ranked_results_for_explain = list(results) if _explain_trace is not None else None
+         final_results = results[:top_k]
+ 
+-        # --- Recall tracking: increment counts + set last_recalled ---
+-        now_iso = datetime.now().isoformat()
+-        wm_ids = [r["id"] for r in final_results if r.get("tier") == "working"]
+-        em_ids = [r["id"] for r in final_results if r.get("tier") == "episodic"]
+-        cursor = self.conn.cursor()
+-        if channel_id:
+-            rec_scope = _session_scope_filter("channel_id", cross_session=cross_session)
+-        elif author_id or author_type:
+-            rec_scope = "(1=1)"
+-        else:
+-            rec_scope = _session_scope_filter(cross_session=cross_session)
+-        if wm_ids:
+-            placeholders = ",".join("?" * len(wm_ids))
+-            rec_params = [now_iso, *tuple(wm_ids)]
+-            if channel_id:
+-                rec_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
+-            elif not (author_id or author_type):
+-                rec_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
+-            cursor.execute(f"""
+-                UPDATE working_memory
+-                SET recall_count = recall_count + 1, last_recalled = ?
+-                WHERE id IN ({placeholders}) AND {rec_scope}
+-            """, (*rec_params,))
+-        if em_ids:
+-            placeholders = ",".join("?" * len(em_ids))
+-            rec_params = [now_iso, *tuple(em_ids)]
++        # P1-1 (2026-08-23): bump_recalled=False = 只读召回 (治理层枚举/预筛),
++        # 不写 recall_count/last_recalled; 默认 True 保持用户召回路径行为。
++        if bump_recalled:
++            # --- Recall tracking: increment counts + set last_recalled ---
++            now_iso = datetime.now().isoformat()
++            wm_ids = [r["id"] for r in final_results if r.get("tier") == "working"]
++            em_ids = [r["id"] for r in final_results if r.get("tier") == "episodic"]
++            cursor = self.conn.cursor()
+             if channel_id:
+-                rec_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
+-            elif not (author_id or author_type):
+-                rec_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
+-            cursor.execute(f"""
+-                UPDATE episodic_memory
+-                SET recall_count = recall_count + 1, last_recalled = ?
+-                WHERE id IN ({placeholders}) AND {rec_scope}
+-            """, (*rec_params,))
+-        self.conn.commit()
++                rec_scope = _session_scope_filter("channel_id", cross_session=cross_session)
++            elif author_id or author_type:
++                rec_scope = "(1=1)"
++            else:
++                rec_scope = _session_scope_filter(cross_session=cross_session)
++            if wm_ids:
++                placeholders = ",".join("?" * len(wm_ids))
++                rec_params = [now_iso, *tuple(wm_ids)]
++                if channel_id:
++                    rec_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
++                elif not (author_id or author_type):
++                    rec_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
++                cursor.execute(f"""
++                    UPDATE working_memory
++                    SET recall_count = recall_count + 1, last_recalled = ?
++                    WHERE id IN ({placeholders}) AND {rec_scope}
++                """, (*rec_params,))
++            if em_ids:
++                placeholders = ",".join("?" * len(em_ids))
++                rec_params = [now_iso, *tuple(em_ids)]
++                if channel_id:
++                    rec_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
++                elif not (author_id or author_type):
++                    rec_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
++                cursor.execute(f"""
++                    UPDATE episodic_memory
++                    SET recall_count = recall_count + 1, last_recalled = ?
++                    WHERE id IN ({placeholders}) AND {rec_scope}
++                """, (*rec_params,))
++            self.conn.commit()
+ 
+         # [C4] Final tier-attribution records. Each counter holds the
+         # number of kept rows attributed to that tier on this call.
+@@ -7243,7 +7302,8 @@
+                            channel_id: Optional[str] = None,
+                            veracity: Optional[str] = None,
+                            memory_type: Optional[str] = None,
+-                           cross_session: Optional[bool] = None) -> List[Dict]:
++                           cross_session: Optional[bool] = None,
++                           bump_recalled: bool = True) -> List[Dict]:
+         """[E5] Polyphonic recall path.
+ 
+         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
+@@ -7382,28 +7442,29 @@
+                 return []
+             return _session_scope_params(self.session_id, cross_session=cross_session)
+ 
+-        # Update recall_count / last_recalled for engine results too --
+-        # the linear path updates them and downstream features (decay
+-        # scheduling, importance reinforcement) depend on the signal.
+-        # /review caught the missing update as a silent telemetry loss.
+-        if recalled_episodic_ids:
+-            placeholders = ",".join("?" * len(recalled_episodic_ids))
+-            params = [now_iso, *recalled_episodic_ids, *_rec_scope_params()]
+-            self.conn.execute(
+-                f"UPDATE episodic_memory SET recall_count = recall_count + 1, "
+-                f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
+-                tuple(params),
+-            )
+-        if recalled_working_ids:
+-            placeholders = ",".join("?" * len(recalled_working_ids))
+-            params = [now_iso, *recalled_working_ids, *_rec_scope_params()]
+-            self.conn.execute(
+-                f"UPDATE working_memory SET recall_count = recall_count + 1, "
+-                f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
+-                tuple(params),
+-            )
+-        if recalled_episodic_ids or recalled_working_ids:
+-            self.conn.commit()
++        if bump_recalled:
++            # Update recall_count / last_recalled for engine results too --
++            # the linear path updates them and downstream features (decay
++            # scheduling, importance reinforcement) depend on the signal.
++            # /review caught the missing update as a silent telemetry loss.
++            if recalled_episodic_ids:
++                placeholders = ",".join("?" * len(recalled_episodic_ids))
++                params = [now_iso, *recalled_episodic_ids, *_rec_scope_params()]
++                self.conn.execute(
++                    f"UPDATE episodic_memory SET recall_count = recall_count + 1, "
++                    f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
++                    tuple(params),
++                )
++            if recalled_working_ids:
++                placeholders = ",".join("?" * len(recalled_working_ids))
++                params = [now_iso, *recalled_working_ids, *_rec_scope_params()]
++                self.conn.execute(
++                    f"UPDATE working_memory SET recall_count = recall_count + 1, "
++                    f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
++                    tuple(params),
++                )
++            if recalled_episodic_ids or recalled_working_ids:
++                self.conn.commit()
+ 
+         # --- MEMORIA structured fact supplement (polyphonic path) ---
+         try:
+diff -ruN a/mnemosyne/core/embeddings.py b/mnemosyne/core/embeddings.py
+--- a/mnemosyne/core/embeddings.py	2026-07-30 17:03:20.000000000 +0800
++++ b/mnemosyne/core/embeddings.py	2026-08-05 15:15:32.339254478 +0800
+@@ -393,8 +393,32 @@
+ 
+ 
+ def serialize(vec: np.ndarray) -> str:
+-    """Serialize embedding to JSON string."""
+-    return json.dumps(vec.tolist())
++    """Serialize embedding.
++
++    2026-08-05 BLOB 化: 返回 float32 二进制 BLOB (1024 dim = 4096 B),
++    替代原 JSON 文本 (~22KB, 5.5x 膨胀)。列名 embedding_json 保留兼容,
++    存储内容为 bytes。读取用 deserialize() 兼容旧 JSON 文本数据。
++    """
++    if vec is None:
++        return b""
++    arr = np.asarray(vec, dtype=np.float32)
++    return arr.tobytes()
++
++
++def deserialize(raw) -> np.ndarray:
++    """Deserialize embedding stored by serialize().
++
++    兼容两种格式:
++      - bytes / BLOB (2026-08-05 新格式): np.frombuffer
++      - str / JSON 文本 (旧格式): json.loads
++    """
++    if raw is None:
++        return None
++    if isinstance(raw, (bytes, bytearray, memoryview)):
++        return np.frombuffer(raw, dtype=np.float32)
++    if isinstance(raw, str):
++        return np.array(json.loads(raw), dtype=np.float32)
++    return np.asarray(raw, dtype=np.float32)
+ 
+ 
+ # Export dimension for other modules
+diff -ruN a/mnemosyne/core/memory.py b/mnemosyne/core/memory.py
+--- a/mnemosyne/core/memory.py	2026-07-30 17:03:20.000000000 +0800
++++ b/mnemosyne/core/memory.py	2026-08-23 09:02:25.755055551 +0800
+@@ -431,7 +431,8 @@
+                vec_weight: float = None,
+                fts_weight: float = None,
+                importance_weight: float = None,
+-               explain: bool = False) -> List[Dict]:
++               explain: bool = False,
++               bump_recalled: bool = True) -> List[Dict]:
+         """
+         Search memories with hybrid relevance scoring.
+         Uses BEAM episodic + working memory retrieval (sqlite-vec + FTS5).
+@@ -453,7 +454,8 @@
+                                              vec_weight=vec_weight,
+                                              fts_weight=fts_weight,
+                                              importance_weight=importance_weight,
+-                                             explain=explain)
++                                             explain=explain,
++                                             bump_recalled=bump_recalled)
+         return self.beam.recall(query, top_k=top_k,
+                                 from_date=from_date, to_date=to_date,
+                                 source=source, topic=topic,
+@@ -465,7 +467,8 @@
+                                 vec_weight=vec_weight,
+                                 fts_weight=fts_weight,
+                                 importance_weight=importance_weight,
+-                                explain=explain)
++                                explain=explain,
++                                bump_recalled=bump_recalled)
+ 
+     def _emit_wrapper(self, event_type: str, memory_id: str, **kwargs) -> None:
+         """Emit a streaming event through the Mnemosyne wrapper layer."""
+@@ -987,6 +990,7 @@
+            fts_weight: float = None,
+            importance_weight: float = None,
+            explain: bool = False,
++           bump_recalled: bool = True,
+            bank: str = None) -> List[Dict]:
+     """Search memories using the global instance with temporal filtering and scoring"""
+     return _get_default(bank).recall(query, top_k,
+@@ -998,7 +1002,8 @@
+                                      vec_weight=vec_weight,
+                                      fts_weight=fts_weight,
+                                      importance_weight=importance_weight,
+-                                     explain=explain)
++                                     explain=explain,
++                                     bump_recalled=bump_recalled)
+ 
+ 
+ def get_context(limit: int = 10, bank: str = None) -> List[Dict]:

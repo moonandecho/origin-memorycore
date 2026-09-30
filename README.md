@@ -80,6 +80,31 @@ Optional (Hermes Agent only): hermes-plugin/memorycore-prefetch
   └───────────────────────────────────────────────────────────────────────┘
 ```
 
+## Cold-tier engine (mnemosyne) and its patches
+
+The cold tier is the upstream MIT package [`mnemosyne-memory`](https://github.com/AxDSan/mnemosyne),
+consumed in-process by `cold_store_client.py` (`LocalBackend`) or over MCP (`RemoteBackend`).
+We run a locally patched copy of it, and `patches/` publishes that patch series so the engine
+can be rebuilt from the public package:
+
+```bash
+deploy/install-engine.sh     # pins upstream 3.15.1, applies the series, checks for rejects
+```
+
+* `patches/README.md` describes what each patch changes and how to verify the result.
+* `deploy/` holds the sample systemd unit, the environment file, and the MCP entry point
+  exposing the engine tools: `remember`, `recall`, `update`, `forget`, `stats`, `list_all`,
+  and `embed_texts`.
+
+The rework published in `patches/0002-engine-rework.patch` makes recall narrow to the
+caller's domain (`scope='global'` no longer widens visibility across domains), caps the
+candidate set inside a domain on the read side, and adds an opt-in core schema with its own
+`vector_store` table so the vector path stops depending on the legacy `memories` /
+`working_memory` join. Nothing in that series changes the tool surface above.
+
+We publish no performance numbers for the engine: ours were measured on one machine and one
+corpus, which says little about another workload.
+
 ## Quick Start
 
 ### Prerequisites

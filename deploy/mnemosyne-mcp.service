@@ -1,0 +1,21 @@
+[Unit]
+Description=mnemosyne cold-tier MCP server (streamable-http)
+Documentation=https://github.com/moonandecho/origin-memorycore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mnemosyne
+Group=mnemosyne
+WorkingDirectory=/opt/mnemosyne
+EnvironmentFile=/etc/mnemosyne/engine.env
+ExecStart=/opt/mnemosyne/venv/bin/python /opt/mnemosyne/mnemosyne_mcp_server.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
