@@ -63,6 +63,7 @@ from .core.overflow import (run_overflow, _recall_safe, _find_best_match,  # noq
                            _lex_evidence)
 from .core.maintenance import run_maintenance  # noqa: E402
 from .core import llm_config  # noqa: E402  # TTL 失效入口 (终审低危)
+from .core import work_state  # noqa: E402  # R3 跨会话未完成事项补丁层
 from .core.decay import _apply_decay  # noqa: E402  # 小项1: 提取到独立模块
 from .core.recall_probe import (  # noqa: E402  # P0 只读观测探针
     query_sha256 as _probe_query_sha256, record_recall_probe)
@@ -1134,6 +1135,51 @@ def _build_recall_probe_event(*, query, top_k, candidate_count, results,
     except Exception:
         # 观测构造自身失败也不得改变工具行为。
         return {"source": "server_recall", "error": "probe_build_error"}
+
+@mcp.tool()
+def memorycore_work_state(list: str, fields: dict) -> str:
+    """跨会话待办/工作线状态清单 (不是记忆正文, 不写热层、不碰冷层、不调 LLM)。
+
+    Hermes 应在跨会话任务的起点、阻塞或待拍板、完成三个节点各写一条补丁:
+    list 传工作线名 (如 memorycore-r3 / 安全巡检), fields 传当前状态字段。
+    任务补丁放 task=任务名 (如 {"task": "移植", "status": "doing"});
+    列表自身状态不放 task (如 {"status": "blocked", "owner": "echo"})。
+    status=done/dropped 的任务和 status=done 的工作线会自动隐藏;
+    null 字段表示清除该键。写入后返回当前仍开放的条目及相对更新时间。
+    """
+    try:
+        work_state.append(list, fields)
+        view = work_state.fold()
+        now = time.time()
+        lists_out = []
+        for lname, ldata in (view.get("lists") or {}).items():
+            if ldata.get("has_list_patch"):
+                lts = float(ldata.get("updated_ts") or now)
+            else:
+                lts = float(ldata.get("activity_ts") or now)
+            tasks_out = []
+            for tname, tdata in (ldata.get("tasks") or {}).items():
+                tts = float(tdata.get("updated_ts") or now)
+                tasks_out.append({
+                    "task": tname,
+                    "fields": tdata.get("fields") or {},
+                    "updated": work_state._age_text(now - tts),
+                    "updated_ts": tts,
+                })
+            lists_out.append({
+                "list": lname,
+                "fields": ldata.get("fields") or {},
+                "updated": work_state._age_text(now - lts),
+                "updated_ts": lts,
+                "tasks": tasks_out,
+            })
+        return json.dumps({"lists": lists_out}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+# R3: work_state 工具始终注册, 工具集断言随新增工具更新期望。
+
 
 @mcp.tool()
 def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:

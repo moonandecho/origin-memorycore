@@ -69,6 +69,7 @@ try:
     )
     from memorycore.core.decay import _apply_decay  # noqa: E402
     from memorycore.core import recall_fusion as _recall_fusion  # noqa: E402  # P2 融合内核(与治理层同一份实现)
+    from memorycore.core import work_state as _ws  # noqa: E402  # R3 未完成事项层
 except ImportError:
     _REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     sys.path.insert(0, _REPO_ROOT)
@@ -93,6 +94,7 @@ except ImportError:
     )
     from memorycore.core.decay import _apply_decay  # noqa: E402
     from memorycore.core import recall_fusion as _recall_fusion  # noqa: E402  # P2 融合内核(与治理层同一份实现)
+    from memorycore.core import work_state as _ws  # noqa: E402  # R3 未完成事项层
 
 # P1 只读观测探针: 与 server 共用同一 env 开关/白名单/fail-silent 语义。
 # 包布局为 memorycore.*; 上面 try/except 已保证 import 路径可用。
@@ -127,6 +129,11 @@ _ACTION_OBJECTS = (
 _ACTION_QUESTION_RE = re.compile(
     r"怎么|如何|怎样|为什么|是什么|是否|吗[？?]?$|呢[？?]?$")
 _ACTION_RECALL_CUES = "用户要求 行为规则 偏好"
+
+# R3 未完成事项块: 独立 600 字符, 与句柄目录两块合计不超过 1400 字符。
+_WORK_STATE_BLOCK_TITLE = "## 未完成事项"
+_WORK_STATE_BUDGET_CHARS = 600
+_COMBINED_PROMPT_BUDGET_CHARS = 1400
 
 # F1 (2026-09-13, FIX4 P0): 查询侧低信息/系统噪声闸门。
 # 取舍原则 (FIX4 §1.4, 写入代码备查):
@@ -308,7 +315,49 @@ class MemoryCorePrefetchProvider(MemoryProvider):
         directory = self._format_directory()
         if directory:
             lines.append(directory)
+        base_block = "\n".join(lines)
+        work_block = self._format_work_state(base_block)
+        if work_block:
+            lines.append(work_block)
         return "\n".join(lines)
+
+    def _format_work_state(self, base_block: str) -> str:
+        """渲染未完成事项块 (放在句柄目录之后, 不挤占目录预算)。
+
+        先把 work_state 渲染为全量行, 与热层全文逐行归一化去重, 再去
+        计预算: 内容 ≤600 字符, 且 base_block + 本块合计 ≤1400 字符。
+        文件不存在/无开放条目时返回空串, system_prompt_block 输出与
+        未接入本层前逐字节一致。
+        """
+        try:
+            raw = _ws.render(max_chars=None)  # 先取全量, 去重后再计预算
+        except Exception:
+            raw = ""
+        if not raw:
+            return ""
+        lines = raw.splitlines()
+        if self._hot_norm:
+            kept: List[str] = []
+            for line in lines:
+                norm = normalize_for_compare(line)
+                if norm and norm in self._hot_norm:
+                    continue
+                kept.append(line)
+            lines = kept
+        if not lines:
+            return ""
+        overhead = len(_WORK_STATE_BLOCK_TITLE) + 2  # 标题前后各一个换行
+        available = _COMBINED_PROMPT_BUDGET_CHARS - len(base_block) - overhead
+        content_budget = min(_WORK_STATE_BUDGET_CHARS, max(0, available))
+        if content_budget <= 0:
+            return ""
+        try:
+            content = _ws._truncate_lines(lines, content_budget)
+        except Exception:
+            content = ""
+        if not content:
+            return ""
+        return _WORK_STATE_BLOCK_TITLE + "\n" + content
 
     def _load_directory(self) -> List[Dict[str, Any]]:
         """从本地 sidecar 读取 stub 句柄目录 (只读本地, 零冷层 RPC)。"""

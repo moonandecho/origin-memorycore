@@ -25,6 +25,7 @@ EXPECTED_TOOLS = {
     "memorycore_get_rule_weight",
     "memorycore_recall",
     "memorycore_set_entry_type",  # v2 (2026-09-12): 人工标注 type/protect override
+    "memorycore_work_state",  # R3: 跨会话未完成事项补丁层
 }
 
 
