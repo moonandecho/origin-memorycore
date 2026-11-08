@@ -49,13 +49,17 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+from . import llm_breaker
 
 log = logging.getLogger("memorycore.llm")
 
@@ -98,6 +102,30 @@ DEFAULT_MAX_CALLS = 8
 # 所有后续直调会被永久拦截。过期后视为新轮: 退避复位、计数器清零。
 BACKOFF_EXPIRE_SECONDS = float(
     os.environ.get("MEMCORE_LLM_BACKOFF_EXPIRE", "60") or 60)
+
+# ---- 失败审计 (纯观测, 失败路径专用) ----------------------------------------
+# 任何 sk-… / Bearer … 形似密钥串一律替换为 *** 后再落盘。
+_SECRET_RE = re.compile(r"sk-\S+|Bearer\s+\S+", re.IGNORECASE)
+
+
+def _audit_path() -> Path:
+    """审计文件路径 (每次写时读 env, 便于测试覆盖)。
+
+    缺省锚定到 MemoryCore 根目录 (本文件上一级目录) 下的
+    logs/llm_failures.jsonl, 不依赖进程当前工作目录;
+    MEMORYCORE_LLM_AUDIT_PATH 覆盖行为不变。
+    """
+    raw = os.environ.get("MEMORYCORE_LLM_AUDIT_PATH", "").strip()
+    default = Path(__file__).resolve().parent.parent / "logs" / "llm_failures.jsonl"
+    return Path(raw or str(default))
+
+
+def _redact_detail(detail: str) -> str:
+    return _SECRET_RE.sub("***", str(detail or ""))
+
+
+def _normalize_fallback(fallback_to: str) -> str:
+    return fallback_to if fallback_to in ("lexical", "ambiguous") else "none"
 
 
 # ---- 配置对象与解析 --------------------------------------------------------
@@ -443,10 +471,14 @@ class LLMGuard:
         self.failures = 0
         self.skipped_cap = 0
         self.skipped_backoff = 0
+        self.skipped_breaker = 0
         self.backoff = False
         self.last_error = ""
         self._backoff_since = 0.0
         self.last_block = ""
+        self._last_consumer = ""
+        self._last_cfg: Optional[LLMConfig] = None
+        self._probe_acquired = False
         self._token = None
         self._unconfigured_logged = False
         self._resolved_logged = False
@@ -461,6 +493,7 @@ class LLMGuard:
         """
         cfg = resolve()
         self.last_block = ""
+        self._last_consumer = consumer
         if not cfg.enabled:
             self.last_block = "disabled"
             if not self._unconfigured_logged:
@@ -498,6 +531,19 @@ class LLMGuard:
             log.warning("LLM: 达到本轮调用上限 %d → %s已跳过",
                         self.max_calls, consumer)
             return None
+        breaker = llm_breaker.check_acquire(cfg.source, cfg.model)
+        if breaker == "blocked":
+            # 持久熔断 (R1): 冷却期内零网络请求, 区别于本轮退避。
+            self.last_block = "breaker"
+            self.skipped_breaker += 1
+            log.warning("LLM: 熔断中（来源 %s, 模型 %s）→ %s已跳过",
+                        cfg.source, cfg.model, consumer)
+            return None
+        self._probe_acquired = breaker == "probe"
+        if self._probe_acquired:
+            log.info("LLM: 熔断已到期, 放行一次探测（来源 %s, 模型 %s）",
+                     cfg.source, cfg.model)
+        self._last_cfg = cfg
         if not self._resolved_logged:
             # 观测三态之二: 已解析 — 仅代表配置解析成功, 不是"通路可用"
             log.info("LLM: 已解析（来源 %s, 模型 %s）", cfg.source, cfg.model)
@@ -508,21 +554,63 @@ class LLMGuard:
     def note_success(self) -> None:
         """真实调用成功后调用 (观测三态之三: 通路已验证)。"""
         self.success += 1
+        if self._probe_acquired and self._last_cfg is not None:
+            # 探测成功 → 清除该 source|model 的全部熔断桶。
+            llm_breaker.clear(self._last_cfg.source, self._last_cfg.model)
+        self._probe_acquired = False
         if not self._verified_logged:
             log.info("LLM: 通路已验证（成功 %d/%d）", self.success, self.calls)
             self._verified_logged = True
 
-    def note_failure(self, category: str = "error", detail: str = "") -> None:
-        """调用失败后调用: 计数 + 触发本轮退避 (剩余候选全部跳过)。"""
+    def note_failure(self, category: str = "error", detail: str = "",
+                     fallback_to: str = "none") -> None:
+        """调用失败后调用: 计数 + 本轮退避 + 持久熔断 + 失败审计。
+
+        fallback_to ∈ lexical / ambiguous / none (未知): 纯审计字段,
+        只描述调用方失败后的保守回退, 不参与任何判定。
+        """
         self.failures += 1
         self.last_error = category + (f": {detail}" if detail else "")
         self.backoff = True
         self._backoff_since = time.time()
+        cfg = self._last_cfg or resolve()
+        if cfg is not None:
+            try:
+                llm_breaker.record_failure(
+                    cfg.source, cfg.model, category,
+                    was_probe=self._probe_acquired)
+            except Exception as e:  # 熔断失败绝不进入主流程
+                log.warning("LLM: 熔断状态更新异常 (%s) → 降级为仅本轮退避", e)
+            self._audit_failure(cfg, self._last_consumer, category,
+                                detail, fallback_to)
+        self._probe_acquired = False
         log.warning("LLM: 调用失败（%s）→ 本轮退避, 剩余候选全部跳过",
                     self.last_error)
 
+    def _audit_failure(self, cfg: LLMConfig, consumer: str, category: str,
+                       detail: str, fallback_to: str) -> None:
+        """失败审计 JSONL (fail-open): 写失败只 warning, 绝不进入主流程。"""
+        try:
+            path = _audit_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": time.time(),
+                "consumer": str(consumer),
+                "category": str(category),
+                "detail": _redact_detail(detail)[:200],
+                "source": str(cfg.source),
+                "model": str(cfg.model),
+                "round_calls": self.calls,
+                "round_failures": self.failures,
+                "fallback_to": _normalize_fallback(fallback_to),
+            }
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log.warning("LLM: 失败审计写失败 (%s)", e)
+
     def block_kind(self) -> str:
-        """上一次 acquire 被拦的原因: '' / disabled / unconfigured / cap / backoff。"""
+        """上一次 acquire 被拦原因: '' / disabled / unconfigured / cap / backoff / breaker。"""
         return self.last_block
 
     # -- 落盘 -----------------------------------------------------------
@@ -551,6 +639,8 @@ class LLMGuard:
             "failures": self.failures,
             "skipped_cap": self.skipped_cap,
             "skipped_backoff": self.skipped_backoff,
+            "skipped_breaker": self.skipped_breaker,
+            "last_block": self.last_block,
             "max_calls": self.max_calls,
             "backoff": self.backoff,
             "last_error": self.last_error,
@@ -608,8 +698,9 @@ def note_success() -> None:
     _current().note_success()
 
 
-def note_failure(category: str = "error", detail: str = "") -> None:
-    _current().note_failure(category, detail)
+def note_failure(category: str = "error", detail: str = "",
+                 fallback_to: str = "none") -> None:
+    _current().note_failure(category, detail, fallback_to)
 
 
 def block_kind() -> str:

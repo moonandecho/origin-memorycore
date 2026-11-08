@@ -22,12 +22,13 @@ from typing import Any, Dict, List, Optional
 from . import llm_config
 
 
-def _call_llm(prompt: str) -> Optional[Dict[str, Any]]:
+def _call_llm(prompt: str, fallback_to: str = "none") -> Optional[Dict[str, Any]]:
     """Call the LLM, return the parsed JSON dict. None on any failure.
 
     Guard (review C2): unconfigured / per-run cap / fail backoff -> None
     (conservative fallback, never blocks maintenance). Observable three
     states go through llm_config into the current session stat["llm"] + logs.
+    fallback_to: audit-only (lexical / ambiguous / none); never affects the decision.
     """
     cfg = llm_config.acquire("冷层判定")
     if cfg is None:
@@ -49,10 +50,10 @@ def _call_llm(prompt: str) -> Optional[Dict[str, Any]]:
         llm_config.note_success()
         return result
     except llm_config.LLMError as e:
-        llm_config.note_failure(e.category, e.detail)
+        llm_config.note_failure(e.category, e.detail, fallback_to)
         return None
     except Exception:
-        llm_config.note_failure("bad_response")
+        llm_config.note_failure("bad_response", "", fallback_to)
         return None
 
 
@@ -89,7 +90,7 @@ def judge_dedup(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "5. 不修改事实内容, 不添加推断, 不自由发挥"
     )
 
-    result = _call_llm(prompt)
+    result = _call_llm(prompt, fallback_to="ambiguous")
     if result is None:
         return None
     if "decision" not in result:
@@ -139,7 +140,7 @@ def judge_stale(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "5. 不修改事实内容, 不添加推断, 不自由发挥"
     )
 
-    result = _call_llm(prompt)
+    result = _call_llm(prompt, fallback_to="ambiguous")
     if result is None:
         return None
     if "decision" not in result:
@@ -194,7 +195,7 @@ def judge_reversal(entries):
         "6. 不添加推断,不修改事实,不自由发挥"
     )
 
-    result = _call_llm(prompt)
+    result = _call_llm(prompt, fallback_to="lexical")
     if result is None:
         return None
     if "decision" not in result:

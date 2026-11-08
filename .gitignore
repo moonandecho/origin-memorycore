@@ -21,3 +21,4 @@ trash.json.lock
 
 # R2: generated residency report (source tree must stay clean)
 tools/residency_dryrun.json
+logs/
