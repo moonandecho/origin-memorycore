@@ -10,8 +10,8 @@
 
 **预注册超参（DESIGN-P2.md §1.3）：不得因 dev/holdout 结果调参。**
 
-开关语义（2026-09-18 起默认开）：未设置 / 空串 / 纯空白 → 开；
-`0/false/no/off`（任意大小写、首尾空白）→ 关；其余值（含拼写错误、随机串）→ 开。
+开关语义（2026-11-16 起默认关，改为显式开启）：未设置 / 空串 / 任意非白名单值 → 关；
+只有 `1/true/yes/on`（任意大小写、首尾空白）→ 开。关闭 = 引擎原始序（dense 序）。
 """
 from __future__ import annotations
 
@@ -23,7 +23,9 @@ from .decay import _apply_decay
 # ---- 开关与预注册超参 ------------------------------------------------------
 FUSION_ENV = "MEMORYCORE_RECALL_FUSION"
 CANDIDATE_K_ENV = "MEMORYCORE_RECALL_FUSION_CANDIDATE_K"
-# 显式关闭白名单（默认开之后：只有这些值关闭融合）
+# 显式开启白名单（默认关之后：只有这些值开启融合）
+ON_VALUES = ("1", "true", "yes", "on")
+# 显式关闭白名单（历史语义保留：默认关时这些值与其它值等价）
 OFF_VALUES = ("0", "false", "no", "off")
 CANDIDATE_K_DEFAULT = 30
 CANDIDATE_K_MAX = 50
@@ -40,25 +42,24 @@ _DIGIT2_RE = re.compile(r"\d{2,}")
 
 
 def fusion_enabled() -> bool:
-    """融合默认开；仅显式白名单假值关闭（2026-09-18 闸门判定后改默认）。
+    """融合默认关（2026-11-16），只有显式白名单真值才开启。
 
-    判定依据（服务器 PREREGISTRATION-v7-rrf.md / RRF-V7-VALIDATION-REPORT.md）：
-    未参与选参的 v7 闸门块（153 正样本 / 79 负控）hit@5 **+10.91pp**，
-    配对 McNemar 精确 p=0.0227（24 组不一致），MRR +0.086，负控误返率不变，
-    每次召回 p50 +4.3ms，无新模型/服务/依赖；30% 封存块同向（+9.30pp，无回退）。
-    关闭 = 回到判定前的原召回路径（逐字节旧行为，由 golden 回归测试钉住）。
+    背景（两轮实测，均为与引擎原始序的配对比较）：
+      2026-09-18 独立块：RRF hit@5 0.5191 vs 原序 0.5792（-6.0pp）
+      2026-11-16 366 条真实查询：RRF 0.503 vs 原序 0.566（-6.3pp；
+        融合独中 26 条、原序独中 49 条）
+    与 2026-09-18 v7 闸门块（+10.91pp）方向相反。v7 报告本身说明：效应量随
+    "引擎排序更差"而变大，其原序基线只有 0.4455；当前引擎原序已到 0.566，
+    此时融合反而拖后腿。默认取原序，保留 `MEMORYCORE_RECALL_FUSION=1`
+    作为显式开启（引擎排序明显变差时可临时打开做回归验证）。
 
-    取值口径（默认开之后）：未设置 / 空串 / 纯空白 → 开；
-    0/false/no/off（任意大小写与首尾空白）→ 关；
-    其余值（含拼写错误与随机串）→ 开（默认即开；见发布说明）。
+    取值口径（默认关之后）：只有 1/true/yes/on（任意大小写与首尾空白）→ 开；
+    其余一律关（含未设置、空串、拼写错误、随机串）。引擎排序差时可显式开。
     """
     raw = os.environ.get(FUSION_ENV)
     if raw is None:
-        return True
-    value = raw.strip().lower()
-    if not value:
-        return True
-    return value not in OFF_VALUES
+        return False
+    return raw.strip().lower() in ON_VALUES
 
 
 def candidate_k() -> int:

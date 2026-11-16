@@ -885,7 +885,7 @@ def memorycore_get_rule_weight(target: str = "memory") -> str:
 
 
 # ---------------------------------------------------------------------------
-# P2: 预注册召回融合 (治理层; 2026-09-18 起默认开, 可显式关)
+# P2: 预注册召回融合 (治理层; 2026-11-16 起默认关, 需显式 1/true/yes/on 开)
 # 内核已抽到 core/recall_fusion.py —— 与 prefetch 插件共用同一份实现
 # (2026-09-18: 插件不再自己拼召回链, 避免副本漂移)。
 # 预注册超参 (DESIGN-P2.md §1.3): 不得因 dev/holdout 结果调参。
@@ -978,7 +978,7 @@ def recall_readonly(query: str = "", top_k: int = 3, *, fusion_on=None):
     """只读评估入口: 与 ``memorycore_recall`` 共用 ``_recall_core`` 内核。
 
     ``fusion_on=None`` 时读取 env 开关 ``MEMORYCORE_RECALL_FUSION``
-    (2026-09-18 起默认开, 可显式 0/false/no/off 关闭);
+    (2026-11-16 起默认关, 需显式 1/true/yes/on 开启);
     env 关闭时与设计轮基线逐字节同路径: 单次
     ``_client.recall_results(bump=False)`` → ``_apply_decay`` → 同样的
     keyword/fts 收口与 page_fault/channel 标注。区别是本函数**不写热层**:

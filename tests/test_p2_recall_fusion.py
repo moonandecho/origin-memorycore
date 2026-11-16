@@ -117,16 +117,16 @@ def test_fusion_off_readonly_bytes_identical(tmp_store, monkeypatch):
 # 预注册配置
 # ---------------------------------------------------------------------------
 
-def test_fusion_switch_default_on(monkeypatch):
-    """2026-09-18 改默认: 未设置即开; 只有显式假值才关。"""
+def test_fusion_switch_default_off(monkeypatch):
+    """2026-11-16 改默认: 未设置即关(走引擎原序); 只有显式真值才开。"""
     monkeypatch.delenv("MEMORYCORE_RECALL_FUSION", raising=False)
-    assert server._recall_fusion_enabled() is True
-    for off in ("0", "false", "off", "no", "FALSE", " off ", "\tNO\n"):
-        monkeypatch.setenv("MEMORYCORE_RECALL_FUSION", off)
-        assert server._recall_fusion_enabled() is False
-    for on in ("1", "true", "on", "yes", "", " ", "none", "flase", "2"):
+    assert server._recall_fusion_enabled() is False
+    for on in ("1", "true", "TRUE", " on ", "\tYes\n"):
         monkeypatch.setenv("MEMORYCORE_RECALL_FUSION", on)
         assert server._recall_fusion_enabled() is True
+    for off in ("0", "false", "off", "no", "", " ", "flase", "2", "none"):
+        monkeypatch.setenv("MEMORYCORE_RECALL_FUSION", off)
+        assert server._recall_fusion_enabled() is False
 
 
 def test_fusion_candidate_k_preregistered_and_capped(monkeypatch):
@@ -240,13 +240,13 @@ def test_memorycore_recall_fusion_on_candidate_k_and_probe(
     assert event["channel"] == ["S", "S", "S", "K"]
 
 
-def test_default_path_uses_fusion_without_env(tmp_store, monkeypatch):
-    """改默认后: env 未设置时生产路径就走融合 (单次 top_k=30 召回)。
+def test_default_path_uses_engine_order_without_env(tmp_store, monkeypatch):
+    """2026-11-16 改默认: env 未设置时走引擎原序 (单次 top_k=k, 不做 RRF)。
 
-    这是 2026-09-18 改默认的核心行为断言 —— 旧用例都显式 pin 关, 这条专门
-    钉住"什么都不设 = 融合开"。
+    旧用例都显式 pin 开, 这条专门钉住"什么都不设 = 不融合"。
     """
-    client = _RecallClient(_fusion_items())
+    items = _fusion_items()
+    client = _RecallClient(items)
     monkeypatch.setattr(server, "_store", tmp_store)
     monkeypatch.setattr(server, "_client", client)
     monkeypatch.delenv("MEMORYCORE_RECALL_FUSION", raising=False)
@@ -256,9 +256,12 @@ def test_default_path_uses_fusion_without_env(tmp_store, monkeypatch):
 
     data = json.loads(server.memorycore_recall("needle", top_k=4))
 
-    assert client.calls == [("needle", 30)]
+    assert client.calls == [("needle", 4)]
     assert client.bumps == [False]
-    assert [r["id"] for r in data["results"]] == ["id0", "id1", "id2", "id4"]
+    ids = [r["id"] for r in data["results"]]
+    assert set(ids) == {it["id"] for it in items[:4]}
+    # 融合序是 id0/id1/id2/id4; 原序不会出现第 5 条
+    assert "id4" not in ids
 
 
 def test_readonly_fusion_on_no_hot_writes_and_same_order(
@@ -449,10 +452,10 @@ def test_fusion_on_non_string_content_keeps_recall_non_empty(
 
 
 @pytest.mark.parametrize("value,expected", [
-    (None, True),
-    ("", True),
-    (" ", True),
-    ("\t\n", True),
+    (None, False),
+    ("", False),
+    (" ", False),
+    ("\t\n", False),
     ("0", False),
     ("1", True),
     ("true", True),
@@ -467,13 +470,13 @@ def test_fusion_on_non_string_content_keeps_recall_non_empty(
     ("no", False),
     ("FALSE", False),
     (" off ", False),
-    ("none", True),
-    ("flase", True),
-    ("2", True),
-    ("random-string", True),
+    ("none", False),
+    ("flase", False),
+    ("2", False),
+    ("random-string", False),
 ])
 def test_fusion_switch_explicit_whitelist(value, expected, monkeypatch):
-    """默认开之后: 只有显式 0/false/no/off 关闭; 其余 (含拼错/空/垃圾串) 一律开。"""
+    """默认关之后: 只有显式 1/true/yes/on 开启; 其余 (含拼错/空/垃圾串) 一律关。"""
     if value is None:
         monkeypatch.delenv("MEMORYCORE_RECALL_FUSION", raising=False)
     else:

@@ -497,6 +497,7 @@ MemoryCore 在万条级冷层规模下做了完整压力测试与召回优化(�
 | `MEMORYCORE_JUDGE_V3_ENABLED` | `1` | SAFE-JUDGE v3 三态判型;`0` 回退词法 v2 |
 | `MEMORYCORE_JUDGE_AMBIGUOUS_HOLD` | `1` | ambiguous 复审期限内留热;`0` 当 rule 处理 |
 | `MEMCORE_LLM_FILE_SOURCES` | `0` | 选择性开启白名单 `~/.hermes/.env` / `config.yaml`,默认关闭 |
+| `MEMORYCORE_RECALL_FUSION` | *(关)* | 召回排序:默认走冷层原序(dense 序);`1/true/yes/on` 启用 RRF 融合(候选池 30 条,`MEMORYCORE_RECALL_FUSION_CANDIDATE_K`)。健康索引下实测 hit@5 反而低约 6pp,仅在引擎排序明显变差时开 |
 
 容量常量位于 `memorycore/core/config.py`(`CHAR_LIMIT_*`、`SOFT_THRESHOLD`、`HARD_THRESHOLD`、`TARGET_RATIO`)。
 

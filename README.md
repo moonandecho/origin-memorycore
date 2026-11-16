@@ -606,6 +606,7 @@ See [examples/cold-store-contract.md](examples/cold-store-contract.md) for the f
 | `MEMORYCORE_RULE_BUDGET_ENABLED` | `1` | Rule-budget eviction layer; `0` disables (hard 5000-char backstop remains) |
 | `MEMORYCORE_JUDGE_V3_ENABLED` | `1` | SAFE-JUDGE v3 ternary typing; `0` rolls back to lexical v2 |
 | `MEMORYCORE_JUDGE_AMBIGUOUS_HOLD` | `1` | Ambiguous entries stay hot under review deadline; `0` treats them as rule |
+| `MEMORYCORE_RECALL_FUSION` | *(off)* | Recall ordering. Off = the cold tier's own (dense) order. `1/true/yes/on` enables RRF over a 30-candidate pool (`MEMORYCORE_RECALL_FUSION_CANDIDATE_K`) — measured ~6pp worse hit@5 on a healthy index, useful only when engine ordering degrades |
 | `MEMCORE_LLM_FILE_SOURCES` | `0` | Opt-in to whitelisted `~/.hermes/.env` / `config.yaml`; never on by default |
 
 Capacity constants live in `memorycore/core/config.py` (`CHAR_LIMIT_*`, `SOFT_THRESHOLD`, `HARD_THRESHOLD`, `TARGET_RATIO`).

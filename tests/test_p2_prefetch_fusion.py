@@ -79,7 +79,8 @@ def _provider(mod, items, monkeypatch, *, fusion_calls, decay_calls, baselines):
     return provider, fake
 
 
-def test_plugin_default_uses_fusion_kernel(monkeypatch):
+def test_plugin_default_uses_engine_order(monkeypatch):
+    """2026-11-16 起融合默认关: 不设 env 走引擎原序 (20 条 + decay)。"""
     monkeypatch.delenv("MEMORYCORE_RECALL_FUSION", raising=False)
     fusion_calls, decay_calls, baselines = [], [], []
     mod = _load_plugin()
@@ -90,11 +91,28 @@ def test_plugin_default_uses_fusion_kernel(monkeypatch):
     provider.prefetch("阿尔法贝塔")
 
     assert fake.queries, "插件未发起冷层召回"
-    assert fake.queries[0][1] == 30, "默认应取 candidate_k=30 条候选"
+    assert fake.queries[0][1] == 20, "默认应取旧口径 20 条候选"
+    assert fake.queries[0][2] is False, "召回必须只读 (bump=False)"
+    assert fusion_calls == [], "默认不融合"
+    assert decay_calls == [20], "默认走纯 decay 排序"
+
+
+def test_plugin_fusion_opt_in_uses_fusion_kernel(monkeypatch):
+    """显式 MEMORYCORE_RECALL_FUSION=1 时才走融合内核 (30 条候选)。"""
+    monkeypatch.setenv("MEMORYCORE_RECALL_FUSION", "1")
+    fusion_calls, decay_calls, baselines = [], [], []
+    mod = _load_plugin()
+    provider, fake = _provider(mod, _ITEMS, monkeypatch,
+                               fusion_calls=fusion_calls,
+                               decay_calls=decay_calls, baselines=baselines)
+
+    provider.prefetch("阿尔法贝塔")
+
+    assert fake.queries, "插件未发起冷层召回"
+    assert fake.queries[0][1] == 30, "融合开启应取 candidate_k=30 条候选"
     assert fake.queries[0][2] is False, "召回必须只读 (bump=False)"
     assert fusion_calls == [(30, 30)], "池应整池交给融合内核排序"
     assert decay_calls == [], "融合开时不应再走纯 decay 排序"
-    assert baselines and baselines[0] == 20, "基线样本口径须固定为前 20 条"
 
 
 def test_plugin_fusion_off_keeps_legacy_path(monkeypatch):

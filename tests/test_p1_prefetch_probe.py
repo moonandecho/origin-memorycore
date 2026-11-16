@@ -86,9 +86,13 @@ def test_prefetch_probe_disabled_is_zero_write(tmp_path, monkeypatch):
 
 def test_prefetch_probe_enabled_identical_injection_and_event(tmp_path,
                                                               monkeypatch):
-    """B②/B④: 开/关输出逐字节一致; 事件 injected/selected 与最终注入一致。"""
+    """B②/B④: 开/关输出逐字节一致; 事件 injected/selected 与最终注入一致。
+
+    本用例钉的是融合开启时的候选池 (2026-11-16 起融合默认关, 故显式 pin 开)。
+    """
     target = tmp_path / "probe" / "recall_probe.jsonl"
     monkeypatch.setenv("MEMORYCORE_RECALL_PROBE_FILE", str(target))
+    monkeypatch.setenv("MEMORYCORE_RECALL_FUSION", "1")
 
     monkeypatch.delenv("MEMORYCORE_RECALL_PROBE", raising=False)
     mod_off = _load_plugin()
@@ -170,3 +174,24 @@ def test_prefetch_probe_query_failure_does_not_change_return(tmp_path,
     provider2, _ = _provider(mod, _ITEMS)
     out = provider2.prefetch("阿尔法贝塔")
     assert out == expected
+
+
+def test_prefetch_default_path_without_fusion_parity(tmp_path, monkeypatch):
+    """融合默认关 (2026-11-16): 探针开关仍不影响注入; 候选池回落到 20。"""
+    target = tmp_path / "probe" / "recall_probe.jsonl"
+    monkeypatch.setenv("MEMORYCORE_RECALL_PROBE_FILE", str(target))
+    monkeypatch.delenv("MEMORYCORE_RECALL_FUSION", raising=False)
+    monkeypatch.delenv("MEMORYCORE_RECALL_PROBE", raising=False)
+
+    mod_off = _load_plugin()
+    provider_off, _ = _provider(mod_off, _ITEMS)
+    out_off = provider_off.prefetch("阿尔法贝塔")
+
+    monkeypatch.setenv("MEMORYCORE_RECALL_PROBE", "1")
+    mod_on = _load_plugin()
+    provider_on, fake_on = _provider(mod_on, _ITEMS)
+    out_on = provider_on.prefetch("阿尔法贝塔")
+
+    assert out_on == out_off
+    assert fake_on.queries and fake_on.queries[0][1] == 20
+    assert fake_on.queries[0][2] is False
