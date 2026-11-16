@@ -26,6 +26,7 @@ EXPECTED_TOOLS = {
     "memorycore_recall",
     "memorycore_set_entry_type",  # v2 (2026-09-12): 人工标注 type/protect override
     "memorycore_work_state",  # R3: 跨会话未完成事项补丁层
+    "memorycore_stub_index",  # 热层指针只读索引 (handle/主题/cold_id)
 }
 
 

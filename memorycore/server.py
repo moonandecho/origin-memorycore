@@ -13,6 +13,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from typing import Any, Dict
 
 try:
     from mcp.server.mcpserver import MCPServer  # noqa: E402  # mcp 2.x 官方高级 API (替代第三方 fastmcp)
@@ -72,6 +73,42 @@ mcp = MCPServer("memorycore")
 
 _store = LocalStore()
 _client = ColdStoreClient()
+
+# ---- 句柄直查: 按 cold_id 取原文 -------------------------------------------
+# 旧实现对 handle 只做「取 stub 主题词(≤10字) 再语义搜索」, 短词必空;
+# 而 stub 的 cold_id 在冷层可取到, 因此加一条直取路径。
+_COLD_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": {}}
+_COLD_CACHE_TTL = 60.0
+
+
+def _cold_rows_by_id(force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """冷层 id → 行 的只读快照 (60 秒缓存)。"""
+    now = time.time()
+    cached = _COLD_CACHE.get("rows") or {}
+    if not force and cached and (now - float(_COLD_CACHE.get("ts") or 0)) < _COLD_CACHE_TTL:
+        return cached
+    rows: Dict[str, Dict[str, Any]] = {}
+    try:
+        for r in _client.list_all() or []:
+            rid = r.get("id") if isinstance(r, dict) else None
+            if rid:
+                rows[str(rid)] = r
+    except Exception:
+        return cached
+    _COLD_CACHE["ts"] = now
+    _COLD_CACHE["rows"] = rows
+    return rows
+
+
+def _cold_fetch_by_id(cold_id: str):
+    """按冷层 id 直取一行; 缓存未命中时强制刷新一次。"""
+    if not cold_id:
+        return None
+    row = _cold_rows_by_id().get(str(cold_id))
+    if row is None:
+        row = _cold_rows_by_id(force=True).get(str(cold_id))
+    return row
+
 
 def _targets(target: str):
     if target == "user":
@@ -356,6 +393,41 @@ def memorycore_run_cold_storage_maintenance() -> str:
 # ---------------------------------------------------------------------------
 # 工具 4: get_memory_usage — 健康状态
 # ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memorycore_stub_index() -> str:
+    """列出热层所有指针条目 (只读): handle / 主题 / 冷层标题前 40 字 / cold_id。
+
+    本地 MEMORY.md 里的指针只显示 sha256 指纹(16 位), 工具认的是 #8 位 handle;
+    先看这张表拿到 handle, 再用 memorycore_recall(handle="#xxxxxxxx") 展开全文。
+    """
+    cold = _cold_rows_by_id()
+    rows = []
+    for target in ("memory", "user"):
+        try:
+            entries = _store.entries(target)
+            metastore = _metastore_for(target)
+        except Exception:
+            continue
+        for entry in entries:
+            meta = metastore.get_entry(entry) or {}
+            if meta.get("type") != "stub" or not meta.get("cold_id"):
+                continue
+            cid = str(meta["cold_id"])
+            full = str((cold.get(cid) or {}).get("content") or "")
+            rows.append({
+                "target": target,
+                "handle": meta.get("handle") or "",
+                "stub": entry[:60],
+                "title": full[:40],
+                "cold_id": cid,
+                "cold_chars": len(full),
+                "resolvable": bool(full),
+            })
+    return json.dumps({"count": len(rows),
+                       "resolvable": sum(1 for r in rows if r["resolvable"]),
+                       "rows": rows}, ensure_ascii=False)
+
 
 @mcp.tool()
 def memorycore_get_memory_usage() -> str:
@@ -1190,7 +1262,8 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
     降权重排。冷层读取统一 bump=False (只读)。
 
     P0 观测: 返回前向 core.recall_probe 落一条独立 JSONL (默认关闭);
-    不改返回顺序/内容, 不新增 MCP 工具。
+    不改返回顺序/内容。另提供 memorycore_stub_index 只读索引。
+    handle 直查: 先按 cold_id 从冷层直取原文(60s 缓存), 取不到才退化为按 stub 主题召回。
 
     口径: 返回内容为候选记忆 (按相似度排序, 未经核实), 不保证与查询
     意图相关; 涉及精确事实/数值时请先交叉核对, 不应直接作为事实依据。
@@ -1221,6 +1294,7 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
                     if _h:
                         handle_map[_h] = {"target": _t, "stub": _e, "meta": _m}
         q = (query or "").strip()
+        _direct_row = None
         if handle:
             hit = handle_map.get(handle)
             if not hit:
@@ -1231,10 +1305,13 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
                     error=f"handle not found: {handle}"))
                 return json.dumps({"error": f"handle not found: {handle}",
                                    "handle": handle}, ensure_ascii=False)
-            q = _stub_topic(hit["stub"]) or q
+            # 先按 cold_id 直取原文; 取不到才退化成主题词语义搜索 (旧行为)。
+            _direct_row = _cold_fetch_by_id(hit["meta"].get("cold_id"))
+            if _direct_row is None:
+                q = _stub_topic(hit["stub"]) or q
         if q:
             log_activity_query(q)
-        if not q:
+        if not q and _direct_row is None:
             record_recall_probe(_build_recall_probe_event(
                 query=q, top_k=k, candidate_count=0, results=[],
                 page_fault=False, restore=0,
@@ -1245,9 +1322,15 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
         _handle_cold_id = (hit["meta"].get("cold_id")
                            if (handle and hit) else None)
         _fusion_on = bool(not handle and _recall_fusion_enabled())
-        results, _ = _recall_core(
-            q, k, fusion_on=_fusion_on, handle_cold_id=_handle_cold_id,
-            candidate_count_sink=_probe_candidate_count_sink)
+        if _direct_row is not None:
+            # 直取不回写热层: 写回会挤占热层字符预算。
+            _row = dict(_direct_row)
+            _row["channel"] = "H"
+            results = [_row]
+        else:
+            results, _ = _recall_core(
+                q, k, fusion_on=_fusion_on, handle_cold_id=_handle_cold_id,
+                candidate_count_sink=_probe_candidate_count_sink)
         _probe_candidate_count = _probe_candidate_count_sink[0]
         # Phase 4: 召回结果命中 stub 的 cold_id → 自动恢复全文到热层。
         # R3: restore 前先快照候选; page_fault 按快照计算, restore 是独立成功计数。
@@ -1258,11 +1341,12 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
         _restore_before = len(results)
         _restore_before_ids = {_probe_id(_r.get("id")) for _r in results
                                if isinstance(_r, dict)}
-        try:
-            results = restore_stubs_from_results(
-                _store, {t: _metastore_for(t) for t in ("memory", "user")}, results)
-        except Exception:
-            pass  # 恢复失败不影响召回返回
+        if _direct_row is None:  # 直取路径不回写热层, 跳过 restore
+            try:
+                results = restore_stubs_from_results(
+                    _store, {t: _metastore_for(t) for t in ("memory", "user")}, results)
+            except Exception:
+                pass  # 恢复失败不影响召回返回
         _restore_after_ids = {_probe_id(_r.get("id")) for _r in results
                               if isinstance(_r, dict)}
         _restored_ids = [rid for rid in

@@ -226,7 +226,8 @@ Exposed tools:
 | Tool | Purpose |
 |---|---|
 | `memorycore_store_entry(content, importance, scope, target, type_hint)` (MCP tool keeps its legacy project-prefixed store name; run `list_tools` to see it) | Unified write entry: routes cold / hot / stale; optional manual `type_hint=state|rule` |
-| `memorycore_recall(query, top_k, handle)` | Actively recall cold-tier memories (read-only, complements per-turn prefetch). `handle` supports direct pointer/page-fault lookup |
+| `memorycore_recall(query, top_k, handle)` | Actively recall cold-tier memories (read-only, complements per-turn prefetch). `handle` resolves the stub's `cold_id` and returns the full text directly (60s cold-index cache, no write-back); falls back to topic recall |
+| `memorycore_stub_index()` | Read-only index of every hot-tier pointer stub: `handle`, topic, cold-tier title (first 40 chars), `cold_id`, size, `resolvable` |
 | `memorycore_trigger_overflow(target)` | Run six-step overflow, target ≤40% |
 | `memorycore_run_cold_storage_maintenance()` | Cold-tier governance pass |
 | `memorycore_get_memory_usage()` | Hot-tier usage + cold-tier stats + thresholds |
@@ -415,9 +416,13 @@ Cache-policy V2 turns hot-tier retention into one unified cache:
   `MAX_EVICT_PER_RUN=3` bounds full-text evictions per round.
 - **Two-stage output.** A normal eviction leaves a ≤40-char pointer stub
   (`STUB_MAX_CHARS=40`, handle ≤ `STUB_HANDLE_MAX_CHARS=20`) with the
-  `cold_id`; `memorycore_recall(..., handle="...")` bypasses the semantic
-  threshold, recalls by the stub topic, marks `page_fault=true`, and feeds
-  the write-back/restore path. At explicit `--budget 0` / zero pointer
+  `cold_id`; `memorycore_recall(..., handle="...")` resolves that `cold_id`
+  against a 60-second cold-tier index snapshot and returns the full text
+  directly (no write-back, so the pointer budget is untouched); if the
+  `cold_id` is gone it falls back to recalling by the stub topic and feeds
+  the write-back/restore path. `memorycore_stub_index()` lists every live
+  pointer with its `handle` and resolvability, since the pointer text in
+  `MEMORY.md` only carries a content fingerprint. At explicit `--budget 0` / zero pointer
   budget the tool goes cold-only: full text is written to the cold tier and
   the local text is deleted without a pointer (`budget_semantics=
   T3_cold_only_zero_pointer_budget` in the replay fixture).

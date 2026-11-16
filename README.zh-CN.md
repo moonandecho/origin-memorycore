@@ -213,7 +213,8 @@ python -m memorycore.server
 | 工具 | 用途 |
 |---|---|
 | `memorycore_store_entry(content, importance, scope, target, type_hint)`(MCP 工具仍保留项目前缀的旧名称,可用 `list_tools` 查看) | 统一写入入口:路由冷 / 热 / 过时;可选 `type_hint=state|rule` 人工判型 |
-| `memorycore_recall(query, top_k, handle)` | 主动召回冷层记忆(只读,补充每轮 prefetch);`handle` 支持指针直查/缺页路径 |
+| `memorycore_recall(query, top_k, handle)` | 主动召回冷层记忆(只读,补充每轮 prefetch);`handle` 按指针的 `cold_id` 直取全文(60 秒冷层索引缓存,不回写热层),取不到才退化为按主题召回 |
+| `memorycore_stub_index()` | 热层指针只读索引: `handle`、主题、冷层标题前 40 字、`cold_id`、字数、是否可解析 |
 | `memorycore_trigger_overflow(target)` | 执行六步溢流,目标 ≤40% |
 | `memorycore_run_cold_storage_maintenance()` | 冷层治理流程 |
 | `memorycore_get_memory_usage()` | 热层用量 + 冷层统计 + 阈值 |
