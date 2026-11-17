@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import difflib
+import fcntl
 import hashlib
 import json
 import logging
@@ -31,6 +32,7 @@ from .classifier import (classify, classify_user_pref, should_keep_local,
                          HOT, COLD, STALE)
 from . import llm_config  # noqa: E402  LLM 唯一真相源 (惰性解析+观测三态+安全阀)
 from . import llm_rot  # noqa: E402  LLM 候选轮转 (终审低危 D2 长尾饿死修复)
+from .guards import is_pointer_text
 from .config import (
     STATE_TTL_DAYS, RULE_COMPRESS_DAYS,
     SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO,
@@ -38,6 +40,7 @@ from .config import (
     RULE_RETYPE_DONE_MARKERS, RULE_RETYPE_BEHAVIOR_MARKERS,
     RULE_STUB_IDLE_DAYS, IMPORTANCE_PROTECT, MAX_STUB_PER_RUN,
     STUB_MAX_CHARS, STUB_PREFIX, STUB_GC_MIN_AGE_DAYS,
+    POINTER_ARCHIVE_FILE, POINTER_ARCHIVE_ENABLED,
     ACTIVITY_WINDOW_DAYS, CROSS_DEDUP_MIN_IDLE_DAYS,
     CLUSTER_EMBED_THRESHOLD,
     RULE_BUDGET_CHARS, RULE_MIN_RESIDENCY_DAYS,
@@ -735,6 +738,60 @@ def _handle_rule_stub_sink(store, client, target: str, entry: str,
         _cold_only_remove("stub_replace_cold_only")
 
 
+
+
+def _pointer_topic(entry: str) -> str:
+    """从指针行取主题 (去掉前缀与箭头后的句柄)。"""
+    s = entry.strip()
+    if s.startswith(STUB_PREFIX):
+        s = s[len(STUB_PREFIX):]
+    return re.split(r"→|->", s)[0].strip()[:60]
+
+
+def _pointer_archive_append(target: str, entry: str, meta: dict,
+                            reason: str, age, rank, stat: dict) -> bool:
+    """退役前把指针写进热层外的 JSONL 墓碑 (2026-11-17)。
+
+    归档成功才允许删热行; 失败时调用方保留指针。
+    开关关闭时返回 True (走旧的直接删除行为)。
+    """
+    if not POINTER_ARCHIVE_ENABLED:
+        return True
+    try:
+        hexes = re.findall(r"recall:([0-9a-f]{8,64})", entry)
+        rec = {
+            "event": "retired",
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "target": target,
+            "topic": _pointer_topic(entry),
+            "hex": hexes[0] if hexes else None,
+            "cold_id": meta.get("cold_id") or None,
+            "handle": meta.get("handle") or None,
+            "reason": reason,
+            "age_days": age,
+            "rank": (round(float(rank), 6) if rank is not None else None),
+            "stub": entry,
+        }
+        POINTER_ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(POINTER_ARCHIVE_FILE, "a", encoding="utf-8") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        stat["pointer_retired"] = stat.get("pointer_retired", 0) + 1
+        return True
+    except Exception:
+        stat["errors"] = stat.get("errors", 0) + 1
+        return False
+
+
 def _stub_gc(store, metastore, target: str, stat: dict,
              force: bool = False) -> None:
     """§6: stub 回收 — 最老优先删本地指针, ≤MAX_STUB_PER_RUN/轮。
@@ -781,6 +838,10 @@ def _stub_gc(store, metastore, target: str, stat: dict,
             continue
         if not force and store.usage_pct(target) < HARD_THRESHOLD * 100:
             break
+        _m = metastore.get_entry(e) or {}
+        if not _pointer_archive_append(target, e, _m, "pressure",
+                                       age, _rank, stat):
+            continue  # 归档失败: 指针留在热层
         before = len(store.entries(target))
         _safe_remove_local(store, target, e, stat)
         if len(store.entries(target)) < before:
@@ -998,6 +1059,7 @@ def run_overflow(store, client, target: str) -> dict:
         "metadata_stamped": 0,   # Phase 2: reconcile 补盖的 legacy 条目数
         "stubbed": 0,            # Phase 3 S4: 休眠 B 类 rule → stub 指针数
         "stub_gc": 0,            # Phase 3 §6: 回收的 stub 指针数
+        "pointer_retired": 0,    # 2026-11-17: 写进墓碑 JSONL 的指针数
         "retyped": 0,            # Phase 3 S2: rule → state 完成态复核数
         "trash_fail": 0,         # E3: 回收队列写入失败数 (可恢复性保护告警)
         "embed_fail": 0,         # E5: 嵌入失败数 (activity/merge 路径同口径)
@@ -1495,6 +1557,11 @@ def _update_pref_anchor(client, store, new_parts: List[str], stat: dict) -> None
 def _handle_cold_migration(store, client, target: str, entry: str,
                            stat: dict) -> None:
     """冷候选条目: 查重 → (跳过/update/remember) → 删本地。"""
+    if is_pointer_text(entry):
+        stat["pointer_as_content_blocked"] = (
+            stat.get("pointer_as_content_blocked", 0) + 1)
+        return
+
     try:
         existing = _recall_safe(client, entry)
     except Exception:
@@ -2041,6 +2108,10 @@ def _cold_write_with_dedup(client, entry: str) -> Tuple[bool, str]:
     cold_id 一律指向冷层真实存在的 id — stub 路径 stamp 后
     restore_stubs_from_results 才能命中 (Phase 4 恢复链路契约)。
     """
+    if is_pointer_text(entry):
+        # 指针不是内容 (2026-11-17)
+        return False, "pointer_not_content"
+
     existing = _recall_safe(client, entry)
     matched = _find_best_match(entry, existing)
     if matched is None:

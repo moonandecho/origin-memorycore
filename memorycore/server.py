@@ -36,6 +36,7 @@ except ImportError as _e:
 
 from .local_store import LocalStore  # noqa: E402
 from .cold_store_client import ColdStoreClient  # noqa: E402
+from .core.guards import is_pointer_text  # noqa: E402
 from .core.config import (SOFT_THRESHOLD, HARD_THRESHOLD, TARGET_RATIO, COLD_SOFT_LIMIT, COLD_HARD_LIMIT,  # noqa: E402
                          STATE_TTL_DAYS, RULE_COMPRESS_DAYS,
                          RULE_MIN_RESIDENCY_DAYS, RULE_BUDGET_CHARS,
@@ -192,6 +193,10 @@ def memorycore_store_entry(content: str, importance: float = 0.8, scope: str = "
         JSON: {"status": "stored"|"cold_stored"|"stale"|"error", "detail": "..."}
     """
     try:
+        if is_pointer_text(content):
+            return json.dumps({"status": "error",
+                               "detail": "pointer_not_content: 指针不是记忆内容"},
+                              ensure_ascii=False)
         # ---- A 写入分流: target="user" 用 classify_user_pref ----
         is_user = (target == "user")
         t = target if target in ("memory", "user") else "memory"

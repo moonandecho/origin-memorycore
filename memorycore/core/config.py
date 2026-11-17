@@ -168,6 +168,11 @@ ACTIVITY_WINDOW_DAYS = 30          # 主题休眠判定窗口
 ACTIVITY_LOG_RETENTION_DAYS = 45   # 日志滚动保留
 ACTIVITY_LOG_MAX_BYTES = 256 * 1024
 ACTIVITY_LOG_FILE = MEMORY_DIR / "activity.jsonl"
+
+# 指针墓碑归档 (2026-11-17): 退役前先写热层外 JSONL, 写成功才删热行。
+# 回滚: MEMORYCORE_POINTER_ARCHIVE=0 恢复旧行为。
+POINTER_ARCHIVE_FILE = MEMORY_DIR / "retired_pointers.jsonl"
+POINTER_ARCHIVE_ENABLED = os.environ.get("MEMORYCORE_POINTER_ARCHIVE", "1") != "0"
 MAX_STUB_PER_RUN = 3               # 每轮溢流 stub 上限 (渐进, 防单轮抽空)
 STUB_MAX_CHARS = 40                # 指针长度上限
 STUB_PREFIX = "[规则指针]"          # 指针前缀: 识别/reconcile 补盖锚点

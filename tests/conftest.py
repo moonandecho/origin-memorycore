@@ -188,3 +188,11 @@ def _isolate_activity(tmp_path, monkeypatch):
     monkeypatch.setattr(meta_mod, "ACTIVITY_LOG_FILE", tmp_path / "activity.jsonl")
     # E8: ACTIVITY_LOG_ENABLED 消费方经 _cfg 委托 config; patch 目标改 config
     monkeypatch.setattr(config_mod, "ACTIVITY_LOG_ENABLED", True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pointer_archive(tmp_path, monkeypatch):
+    """隔离指针墓碑归档 (2026-11-17): 测试绝不写用户目录下的生产归档文件。"""
+    from memorycore.core import overflow as ov
+    monkeypatch.setattr(ov, "POINTER_ARCHIVE_FILE",
+                        tmp_path / "retired_pointers.jsonl")

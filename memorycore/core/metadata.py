@@ -37,6 +37,7 @@ log = logging.getLogger("memorycore.metadata")
 from .classifier import (classify_entry_type, should_keep_local,
                          judge_engine_enabled)
 from .judge import judge_entry
+from .guards import is_pointer_text
 from .config import (MEMORY_FILE, USER_FILE, META_SUFFIX,
                      ACTIVITY_LOG_RETENTION_DAYS,
                      ACTIVITY_LOG_MAX_BYTES, ACTIVITY_LOG_FILE,
@@ -818,6 +819,10 @@ def direct_write_govern(store, client, target: str, content: str,
         return {"status": "stamped_stub"}
 
     # state: 冷迁移 (与 overflow _handle_cold_migration 同安全语义)
+    if is_pointer_text(content):
+        metastore.stamp(content, "stub", origin="hermes",
+                        type_source=_type_source)
+        return {"status": "stamped_stub", "reason": "pointer_not_content"}
     # 惰性导入防环: overflow.py 顶层导入本模块, 这里运行时再取共享原语。
     from .overflow import _recall_safe, _find_best_match, _merge_two_entries
 
