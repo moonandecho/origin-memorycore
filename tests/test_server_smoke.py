@@ -17,6 +17,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 EXPECTED_TOOLS = {
+    "memorycore_find",
+    "memorycore_timeline",
     "memorycore_" + "store_fact",
     "memorycore_trigger_overflow",
     "memorycore_run_cold_storage_maintenance",

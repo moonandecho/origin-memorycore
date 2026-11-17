@@ -196,3 +196,10 @@ def _isolate_pointer_archive(tmp_path, monkeypatch):
     from memorycore.core import overflow as ov
     monkeypatch.setattr(ov, "POINTER_ARCHIVE_FILE",
                         tmp_path / "retired_pointers.jsonl")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_audit(tmp_path, monkeypatch):
+    """隔离 LLM 失败审计日志 (2026-11-17): 测试绝不写生产 logs/llm_failures.jsonl。"""
+    monkeypatch.setenv("MEMORYCORE_LLM_AUDIT_PATH",
+                       str(tmp_path / "llm_failures.jsonl"))

@@ -64,6 +64,7 @@ from .core.overflow import (run_overflow, _recall_safe, _find_best_match,  # noq
                            _ambiguous_hold_valid,
                            _lex_evidence)
 from .core.maintenance import run_maintenance  # noqa: E402
+from .core.timeline import timeline as _timeline, find as _find  # noqa: E402
 from .core import llm_config  # noqa: E402  # TTL 失效入口 (终审低危)
 from .core import work_state  # noqa: E402  # R3 跨会话未完成事项补丁层
 from .core.decay import _apply_decay  # noqa: E402  # 小项1: 提取到独立模块
@@ -1300,20 +1301,28 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
                         handle_map[_h] = {"target": _t, "stub": _e, "meta": _m}
         q = (query or "").strip()
         _direct_row = None
+        _mode_direct = "handle"
         if handle:
-            hit = handle_map.get(handle)
+            _hkey = handle[7:] if handle.lower().startswith("recall:") else handle
+            hit = handle_map.get(handle) or handle_map.get(_hkey)
             if not hit:
-                record_recall_probe(_build_recall_probe_event(
-                    query=q, top_k=k, candidate_count=0, results=[],
-                    page_fault=False, restore=0,
-                    latency_ms=(time.perf_counter() - _probe_t0) * 1000.0,
-                    error=f"handle not found: {handle}"))
-                return json.dumps({"error": f"handle not found: {handle}",
-                                   "handle": handle}, ensure_ascii=False)
-            # 先按 cold_id 直取原文; 取不到才退化成主题词语义搜索 (旧行为)。
-            _direct_row = _cold_fetch_by_id(hit["meta"].get("cold_id"))
-            if _direct_row is None:
-                q = _stub_topic(hit["stub"]) or q
+                # 兼容 memorycore_find / timeline 返回的冷层 id (16 位 hex):
+                # 不是句柄时按 cold_id 直取, 取不到才报错。
+                _direct_row = _cold_fetch_by_id(_hkey)
+                if _direct_row is None:
+                    record_recall_probe(_build_recall_probe_event(
+                        query=q, top_k=k, candidate_count=0, results=[],
+                        page_fault=False, restore=0,
+                        latency_ms=(time.perf_counter() - _probe_t0) * 1000.0,
+                        error=f"handle not found: {handle}"))
+                    return json.dumps({"error": f"handle not found: {handle}",
+                                       "handle": handle}, ensure_ascii=False)
+                _mode_direct = "cold_id"
+            else:
+                # 先按 cold_id 直取原文; 取不到才退化成主题词语义搜索 (旧行为)。
+                _direct_row = _cold_fetch_by_id(hit["meta"].get("cold_id"))
+                if _direct_row is None:
+                    q = _stub_topic(hit["stub"]) or q
         if q:
             log_activity_query(q)
         if not q and _direct_row is None:
@@ -1371,7 +1380,7 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
         return json.dumps({"results": _json_safe_response(results),
                            "handle": handle,
                            "page_fault": bool(handle),
-                           "mode": "handle" if handle else "semantic"},
+                           "mode": _mode_direct if handle else "semantic"},
                           ensure_ascii=False)
     except Exception as e:
         # 探针自身 fail-silent; 不吞掉工具原有错误返回。
@@ -1383,6 +1392,33 @@ def memorycore_recall(query: str = "", top_k: int = 3, handle: str = "") -> str:
             latency_ms=(time.perf_counter() - _probe_t0) * 1000.0,
             error=str(e)[:280]))
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+# ---------------------------------------------------------------------------
+# 只读检索: timeline / find
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memorycore_timeline(handle: str = "", id: str = "", before: int = 3,
+                        after: int = 3, window_hours: int = 24,
+                        max_chars: int = 60) -> str:
+    """按 handle 或 id 查看冷层某条的上下文时间线 (只读, 不碰冷层写接口)。
+
+    返回中心条目的截断主题、窗口内最近 before/after 邻居、同日历日条数
+    与 weak (孤立条目) 标记; 不返回任何条目全文。
+    """
+    return _timeline(_store, _client, _metastore_for, handle=handle, id=id,
+                     before=before, after=after, window_hours=window_hours,
+                     max_chars=max_chars)
+
+
+@mcp.tool()
+def memorycore_find(entity: str, kind: str = "any", limit: int = 20) -> str:
+    """在冷层全量条目中做大小写不敏感子串检索 (只读, 不碰冷层写接口)。
+
+    kind: any|host|path|repo|date; 非法值按 any 处理。返回只含截断 topic
+    的匹配列表, matched 为截断前真实命中数。
+    """
+    return _find(_client, entity, kind=kind, limit=limit)
 
 
 def __getattr__(name: str):
